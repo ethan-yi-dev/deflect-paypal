@@ -1,32 +1,24 @@
-import { connection } from "next/server";
-import { SubscriptionsController } from "@paypal/paypal-server-sdk";
-import { client } from "@/lib/paypal";
+import Link from "next/link";
 
-export default async function Home() {
-  await connection();
+const pages = [
+  { href: "/transactions", label: "Transaction search" },
+  { href: "/subscriptions", label: "Subscriptions" },
+  { href: "/balances", label: "Balances" },
+];
 
-  const { result } = await new SubscriptionsController(client).listBillingPlans({
-    pageSize: 20,
-  });
-  const plans = result.plans ?? [];
-
+export default function Home() {
   return (
     <main className="mx-auto w-full max-w-3xl p-16 font-sans">
-      <h1 className="mb-6 text-2xl font-semibold">PayPal billing plans</h1>
-      {plans.length === 0 ? (
-        <p className="text-zinc-500">No plans found.</p>
-      ) : (
-        <ul className="divide-y divide-zinc-200 dark:divide-zinc-800">
-          {plans.map((plan) => (
-            <li key={plan.id} className="flex justify-between py-3">
-              <span>{plan.name}</span>
-              <span className="font-mono text-sm text-zinc-500">
-                {plan.status} · {plan.id}
-              </span>
-            </li>
-          ))}
-        </ul>
-      )}
+      <h1 className="mb-6 text-2xl font-semibold">PayPal APIs</h1>
+      <ul className="divide-y divide-zinc-200 dark:divide-zinc-800">
+        {pages.map((page) => (
+          <li key={page.href} className="py-3">
+            <Link href={page.href} className="hover:underline">
+              {page.label} →
+            </Link>
+          </li>
+        ))}
+      </ul>
     </main>
   );
 }
