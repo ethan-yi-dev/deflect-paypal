@@ -13,6 +13,30 @@
 
 A Next.js app that reads sandbox data with the [PayPal TypeScript Server SDK](https://github.com/paypal/PayPal-TypeScript-Server-SDK) (`@paypal/paypal-server-sdk`) and shows it in simple tables.
 
+## Origin and attribution
+
+Deflect is based on the official PayPal starter repository,
+[`paypaldev/hackathon-paypal-ag-grid-boilerplate`](https://github.com/paypaldev/hackathon-paypal-ag-grid-boilerplate),
+at commit [`8de661bda9f6dd10c5d930767e8cb185a15f6b83`](https://github.com/paypaldev/hackathon-paypal-ag-grid-boilerplate/tree/8de661bda9f6dd10c5d930767e8cb185a15f6b83).
+The initial Deflect codebase matches that baseline. The following material
+was inherited from the starter:
+
+- **PayPal integration:** `lib/paypal.ts`, including the sandbox SDK client and transaction, subscription-plan, and balance queries; `env.example`.
+- **Pages and UI:** `app/page.tsx`, the pages under `app/transactions/`, `app/subscriptions/`, and `app/balances/`, plus `app/data-table.tsx`, `app/layout.tsx`, `app/globals.css`, and `app/favicon.ico`.
+- **Project scaffolding and assets:** `package.json`, the initial `package-lock.json`, `next.config.ts`, `tsconfig.json`, `eslint.config.mjs`, `postcss.config.mjs`, `.gitignore`, the assets under `public/`, and `AGENTS.md` / `CLAUDE.md`.
+- **Documentation:** the hackathon introduction, local setup instructions, SDK explanations, data-page descriptions, and sandbox response examples in this README.
+
+Subsequent original additions and modifications are contributions to Deflect;
+the inherited portions retain the attribution above.
+
+## License
+
+Original contributions to Deflect are licensed under the MIT License; see
+[`LICENSE`](LICENSE). The recorded upstream starter has no `LICENSE` file,
+so this project's MIT license does **not** cover the inherited material or
+grant permission on behalf of its rights holders. Third-party dependencies
+and assets remain subject to their respective licenses.
+
 ## Run locally
 
 Requires Node.js 20.9 or later and a PayPal sandbox REST app ([developer.paypal.com](https://developer.paypal.com/dashboard/applications/sandbox)). The Transaction Search pages also need the app's **Transaction search** feature enabled.
