@@ -51,27 +51,50 @@ Open [http://localhost:3000](http://localhost:3000). Next.js only loads the dott
 
 Other scripts: `npm run build` (production build), `npm run start` (serve the build), `npm run lint`.
 
-## Deflect frontend preview
+## Deflect dispute workspace
 
-The home page (`/`) is a single-page dispute workspace with a case summary,
-customer complaint, payment and fulfillment facts, suggested actions,
-Policy/JEV results, action previews, and an audit trail. It uses hardcoded
-fixtures in `app/demo-dispute.ts`; it does not call PayPal or an AI service.
-The frontend preview can run without PayPal credentials and uses system fonts.
+The home page (`/`) loads disputes from the configured PayPal Sandbox merchant.
+It selects the most recently updated dispute in the returned list page, then
+retrieves its full details. Use **Account disputes** to select another returned
+case, enter a dispute ID to query it directly, or refresh the account list.
+Amounts, status, messages, transactions, requested evidence, available actions,
+and the expandable raw response come from PayPal. Missing data stays unknown.
+
+Next.js serves both the frontend and these same-origin, read-only endpoints:
+
+- `GET /api/disputes`: the first list page returned by PayPal.
+- `GET /api/disputes/{id}`: current dispute details.
+
+`lib/paypal-disputes.ts` is a server-only facade around the Disputes REST client.
+It reads `PAYPAL_CLIENT_ID` and `PAYPAL_SECRET` from `.env.local`, obtains and
+caches an OAuth token, and retries a read once if the token is rejected.
+Credentials and tokens are never returned to the browser. Dispute queries
+and responses use `no-store`; provider errors are sanitized. The connection
+always uses `https://api-m.sandbox.paypal.com`. It does not execute dispute actions.
+
+Order/carrier lookups, AI recommendations, Policy/JEV checks, and persistent
+audit storage are not connected. Tracking supplied in case evidence is shown
+as unverified. **Query history** records reads in the current browser session
+and resets on reload.
+
+**View demo studio** opens the separate hardcoded fixtures in
+`app/demo-dispute.ts`. Demo data is never substituted for a failed PayPal query.
 
 Select **Missing tracking**, **Delivery confirmed**, or **Injection attempt**
 to explore the predefined scenarios. **Run demo analysis** replays a fixed
 recommendation. **Preview action → Simulate action** adds an in-memory audit
-entry; no message, evidence, or refund is sent. Reloading resets the demo.
-The delivery scenario uses explicitly fictional shipment data.
+entry; no message, evidence, or refund is sent. The delivery scenario uses
+explicitly fictional shipment data. **View PayPal disputes** returns to real
+Sandbox queries. The demo studio can run without PayPal credentials.
 
 Start with `npm run dev`, then open `http://localhost:3000`.
 The original live SDK pages remain available at `/transactions`,
 `/subscriptions`, and `/balances` and require configured PayPal credentials.
+Run `npm run test:disputes` for the mocked Disputes client and normalization checks.
 
 ## How it works
 
-Every SDK call lives in [`lib/paypal.ts`](lib/paypal.ts), which owns the sandbox `Client`. Each original data page is a server component that calls one of those functions and renders the result with [`app/data-table.tsx`](app/data-table.tsx). These data pages call `await connection()` so they render per request with live data instead of being prerendered at build time. The home-page frontend preview is independent of this SDK integration.
+Every SDK call lives in [`lib/paypal.ts`](lib/paypal.ts), which owns the sandbox `Client`. Each original data page is a server component that calls one of those functions and renders the result with [`app/data-table.tsx`](app/data-table.tsx). These data pages call `await connection()` so they render per request with live data instead of being prerendered at build time. The dispute workspace uses a separate REST client because the installed Server SDK does not expose the Disputes API.
 
 ## Data pages
 

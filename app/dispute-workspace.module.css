@@ -216,6 +216,25 @@
 .fulfillmentFound p { color: #58703f; }
 .amber { color: #88652e; }
 .red { color: #9b5544; }
+.sourceSwitch { display: inline-flex; align-items: center; gap: 6px; font-size: 11px !important; color: #58703f; padding: 5px 0; }
+.sourceSwitch:hover { color: #284c37; }
+.errorBanner { display: flex; align-items: flex-start; gap: 12px; padding: 17px; margin-bottom: 20px; background: #fcf3ef; border: 1px solid #eed1c7; color: #985d4b; border-radius: 8px; }
+.errorBanner > svg { flex-shrink: 0; margin-top: 3px; }
+.errorBanner > div { flex: 1; min-width: 0; }
+.errorBanner strong { font-size: 13px; font-weight: 550; }
+.errorBanner p { font-size: 12px; line-height: 1.7; margin-top: 4px; overflow-wrap: anywhere; }
+.liveBlockHeading { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 23px 0 13px; }
+.liveBlockHeading > span:first-child { display: flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 550; }
+.emptyText { color: #6b765f; font-size: 12px; line-height: 1.8; padding: 14px 0; }
+.transactionGroup + .transactionGroup { border-top: 1px solid #e6e9e2; padding-top: 14px; margin-top: 14px; }
+.factDate { display: block; color: #6b765f; font-size: 10px; margin-top: 4px; }
+.pipelineList { display: grid; gap: 21px; padding: 26px 2px 9px; }
+.pipelineList > div { display: flex; align-items: flex-start; gap: 12px; }
+.pipelineList > div > span { display: grid; place-items: center; flex-shrink: 0; width: 22px; height: 22px; color: #738f5b; }
+.pipelineList strong { font-size: 13px; font-weight: 500; }
+.pipelineList p { color: #6b765f; font-size: 12px; margin-top: 4px; line-height: 1.7; }
+.demoStudioButton { display: flex; width: 100%; margin-top: 22px; }
+@media (max-width: 650px) { .topbarRight { gap: 12px; } .sourceSwitch { font-size: 10px !important; } .topbarRight .demoLabel { font-size: 10px; } .breadcrumb { gap: 6px; font-size: 11px; } .errorBanner { flex-wrap: wrap; } .errorBanner > button { margin-left: 32px; } .scenarioControl select { min-width: 0; flex: 1; max-width: 235px; } .liveBlockHeading .sourceLabel { font-size: 10px; } .messageMeta { flex-wrap: wrap; } .messageMeta > span:last-child { width: 100%; padding-left: 32px; } }
 @media (min-width: 1600px) { .content { padding-top: 45px; } .sidebar { width: 246px; padding-left: 25px; padding-right: 25px; } }
 @media (max-width: 1150px) { .sidebar { width: 188px; padding-left: 14px; padding-right: 14px; } .brand { font-size: 27px; } .content { padding: 30px 25px 20px; } .topbar { padding: 0 25px; } .panelHeader { padding-left: 17px; padding-right: 17px; } .panelBody { padding-left: 17px; padding-right: 17px; } .workspaceGrid { gap: 15px; } .smallMuted { font-size: 10px; } .summaryGrid > div { padding: 0 15px; } .actionButtons { flex-direction: column; align-items: stretch; } .messageMeta > span:last-child { font-size: 10px; } }
 @media (max-width: 950px) { .workspaceGrid { grid-template-columns: 1fr; } .actionButtons { flex-direction: row; } .controls { flex-wrap: wrap; } .caseCardTop { align-items: flex-start; } .caseCardTop > .badge { font-size: 10px; } .summaryGrid { grid-template-columns: 1fr 1fr; gap: 22px 0; } .summaryGrid > div:nth-child(3) { border-left: 0; padding-left: 0; } .pageHeading { align-items: flex-start; } .modePill { margin-top: 22px; font-size: 10px; padding: 6px 8px; } .pageHeading h1 { font-size: 28px; } }

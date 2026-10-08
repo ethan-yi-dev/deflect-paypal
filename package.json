@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "pretest:disputes": "tsc tests/paypal-disputes.test.ts --outDir .next/dispute-tests --target ES2022 --module commonjs --moduleResolution node --esModuleInterop --strict --skipLibCheck --types node",
+    "test:disputes": "node --test .next/dispute-tests/tests/paypal-disputes.test.js"
   },
   "dependencies": {
     "@paypal/paypal-server-sdk": "^2.5.0",
