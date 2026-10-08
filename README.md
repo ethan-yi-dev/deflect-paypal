@@ -60,8 +60,12 @@ with its ID, amount, reason, and status. Click a case to view its details, enter
 dispute ID to query it directly, or refresh the list beside **Active cases**.
 Refreshing the list keeps the selected case if it is still present. On smaller
 screens the case list appears above the workspace.
-Amounts, status, messages, transactions, requested evidence, available actions,
-and the expandable raw response come from PayPal. Missing data stays unknown.
+The case details focus on customer support: the concern and conversation,
+initiator, opened/updated times, seller response deadline, disputed and requested
+refund amounts, related items, and evidence requests. The initiator is taken from
+case creation evidence; it remains unknown when that evidence is missing.
+Payment identifiers, fund movement history, API action names, and raw JSON are
+kept out of the support view. Missing data stays unknown.
 
 Next.js serves both the frontend and these same-origin, read-only endpoints:
 
@@ -77,8 +81,32 @@ always uses `https://api-m.sandbox.paypal.com`. It does not execute dispute acti
 
 Order/carrier lookups, AI recommendations, Policy/JEV checks, and persistent
 audit storage are not connected. Tracking supplied in case evidence is shown
-as unverified. **Query history** records reads in the current browser session
-and resets on reload.
+as unverified. **Case activity** shows the dispute's opened and updated times
+and seller response deadline in Pacific time.
+
+### Evidence preparation
+
+The support view includes a baseline check based on PayPal's
+[reason/evidence guide](https://developer.paypal.com/platforms/disputes/reference/dispute-reasons/).
+The specific `REQUESTED_FROM_SELLER` evidence types override the baseline;
+reference options are not all mandatory. Fulfillment, refund, and explanatory
+evidence show different fields. Unknown evidence types require manual review.
+The file picker and PayPal button depend on the presence of a POST
+`provide_evidence` / `provide-evidence` link. This action is distinct from `appeal`.
+
+Selected files appear with their names, sizes, and **Not uploaded** status.
+They stay in memory with the case's draft while switching cases; reloading
+clears them. Files already listed as seller submissions in the PayPal response
+appear separately. Files must be JPG/JPEG, GIF, PNG, or PDF, individually smaller
+than 10 MB, with up to 50 MB total, following the
+[official file requirements](https://developer.paypal.com/platforms/disputes/reference/supported-file-types-sizes/).
+This local validation checks format and size, not document authenticity.
+
+**Run Deflect assessment** currently checks draft fields with the baseline rules
+and suggests what to collect or review. It does not call an LLM or grant
+Policy/JEV approval. **Submit evidence to PayPal** opens a local review preview;
+confirming it sends no files or PayPal requests. Both actions are ready for
+future API integration. The existing backend remains read-only.
 
 **View demo studio** opens the separate hardcoded fixtures in
 `app/demo-dispute.ts`. Demo data is never substituted for a failed PayPal query.

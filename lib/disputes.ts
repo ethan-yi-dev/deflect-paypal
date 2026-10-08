@@ -23,6 +23,7 @@ export type DisputeMessage = {
   postedAt: string | null;
 };
 export type DisputeDetail = DisputeSummary & {
+  initiatedBy: "BUYER" | "SELLER" | null;
   createdAt: string | null;
   state: string | null;
   channel: string | null;
@@ -32,6 +33,8 @@ export type DisputeDetail = DisputeSummary & {
   transactions: DisputeTransaction[];
   messages: DisputeMessage[];
   requestedEvidence: string[];
+  canProvideEvidence: boolean;
+  sellerDocuments: { evidenceType: string | null; name: string; submittedAt: string | null }[];
   tracking: { carrier: string | null; number: string | null }[];
   fundMovements: { reason: string | null; party: string | null; amount: Money | null; time: string | null }[];
   availableActions: string[];
@@ -84,6 +87,7 @@ export function normalizeDisputeDetail(value: unknown): DisputeDetail {
   const input = record(value);
   const summary = normalizeDisputeSummary(input);
   const evidences = list(input.evidences).map(record);
+  const creator = evidences.find((evidence) => evidence.evidence_type === "CREATE");
   const messages: DisputeMessage[] = list(input.messages).flatMap((value) => {
     const message = record(value);
     const content = text(message.content);
@@ -106,6 +110,7 @@ export function normalizeDisputeDetail(value: unknown): DisputeDetail {
 
   return {
     ...summary,
+    initiatedBy: creator?.source === "SUBMITTED_BY_BUYER" ? "BUYER" : creator?.source === "SUBMITTED_BY_SELLER" ? "SELLER" : null,
     createdAt: text(input.create_time),
     state: text(input.dispute_state),
     channel: text(input.dispute_channel),
@@ -132,6 +137,12 @@ export function normalizeDisputeDetail(value: unknown): DisputeDetail {
     }),
     messages,
     requestedEvidence: [...new Set(evidences.filter((evidence) => evidence.source === "REQUESTED_FROM_SELLER").flatMap((evidence) => text(evidence.evidence_type) ? [text(evidence.evidence_type)!] : []))],
+    // Expose availability, not an executable provider URL. No link is followed here.
+    canProvideEvidence: list(input.links).map(record).some((link) => link.method === "POST" && text(link.rel)?.replaceAll("_", "-") === "provide-evidence" && !!text(link.href)),
+    sellerDocuments: evidences.filter((evidence) => evidence.source === "SUBMITTED_BY_SELLER").flatMap((evidence) => list(evidence.documents).map(record).flatMap((document) => {
+      const name = text(document.name);
+      return name ? [{ evidenceType: text(evidence.evidence_type), name, submittedAt: text(evidence.date) }] : [];
+    })),
     tracking: tracking.filter((item) => {
       const key = `${item.carrier}\0${item.number}`;
       if (trackingKeys.has(key)) return false;

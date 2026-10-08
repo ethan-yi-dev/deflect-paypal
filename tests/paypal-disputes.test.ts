@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeDisputeDetail } from "../lib/disputes";
 import { createPayPalDisputesClient, PayPalDisputesError } from "../lib/paypal-disputes-client";
+import { assessEvidence, checkEvidence, getEvidencePlan, MAX_FILE_BYTES, MAX_TOTAL_BYTES, validateEvidenceFiles, type EvidenceInput } from "../lib/dispute-evidence";
 
 const caseId = "PP-R-TEST-001";
 const credentials = () => ({ clientId: "test-client", secret: "test-secret" });
@@ -11,6 +12,9 @@ const detail = () => Response.json({ dispute_id: caseId, reason: "MERCHANDISE_OR
 test("missing fields remain unknown, with no fabricated payment or fulfillment facts", () => {
   const result = normalizeDisputeDetail({ dispute_id: caseId });
   assert.equal(result.amount, null);
+  assert.equal(result.initiatedBy, null);
+  assert.equal(result.canProvideEvidence, false);
+  assert.deepEqual(result.sellerDocuments, []);
   assert.equal(result.allowedRefundAmount, null);
   assert.equal(result.sellerResponseDueAt, null);
   assert.deepEqual(result.transactions, []);
@@ -38,6 +42,7 @@ test("normalization preserves multiple transactions and exact money while dedupl
   assert.equal(result.transactions[0].sellerTransactionId, "CAPTURE-1");
   assert.equal(result.transactions[0].buyerTransactionId, "BUYER-1");
   assert.equal(result.messages.length, 1);
+  assert.equal(result.initiatedBy, "BUYER");
   assert.deepEqual(result.requestedEvidence, ["PROOF_OF_FULFILLMENT"]);
   assert.equal(result.tracking.length, 1);
   assert.deepEqual(result.availableActions, ["send_message"]);
@@ -47,6 +52,95 @@ test("a missing messages array can use buyer CREATE notes without treating them 
   const result = normalizeDisputeDetail({ dispute_id: caseId, evidences: [{ evidence_type: "CREATE", source: "SUBMITTED_BY_BUYER", notes: "Please refund." }] });
   assert.deepEqual(result.messages.map((message) => [message.author, message.content]), [["BUYER", "Please refund."]]);
   assert.equal(result.allowedRefundAmount, null);
+});
+
+test("case initiator comes from creation evidence, not from a later message author", () => {
+  const sellerCase = normalizeDisputeDetail({
+    dispute_id: caseId,
+    evidences: [{ evidence_type: "CREATE", source: "SUBMITTED_BY_SELLER" }],
+    messages: [{ posted_by: "BUYER", content: "A later reply." }],
+  });
+  assert.equal(sellerCase.initiatedBy, "SELLER");
+  assert.equal(normalizeDisputeDetail({ dispute_id: caseId, messages: [{ posted_by: "BUYER", content: "A reply without creation evidence." }] }).initiatedBy, null);
+});
+
+test("evidence preparation uses only seller requests and recognizes a POST evidence link", () => {
+  for (const rel of ["provide_evidence", "provide-evidence"]) {
+    const result = normalizeDisputeDetail({
+      dispute_id: caseId,
+      links: [{ rel, method: "POST", href: "https://api-m.sandbox.paypal.com/v1/customer/disputes/PP-R-TEST-001/provide-evidence" }],
+      evidences: [
+        { source: "REQUESTED_FROM_BUYER", evidence_type: "PROOF_OF_REFUND" },
+        { source: "REQUESTED_FROM_SELLER", evidence_type: "OTHER" },
+        { source: "SUBMITTED_BY_BUYER", evidence_type: "OTHER", documents: [{ name: "buyer.pdf" }] },
+        { source: "SUBMITTED_BY_SELLER", evidence_type: "OTHER", documents: [{ name: "seller.pdf" }], date: "2026-10-08T00:00:00Z" },
+      ],
+    });
+    assert.equal(result.canProvideEvidence, true);
+    assert.deepEqual(result.requestedEvidence, ["OTHER"]);
+    assert.deepEqual(result.sellerDocuments, [{ name: "seller.pdf", evidenceType: "OTHER", submittedAt: "2026-10-08T00:00:00Z" }]);
+  }
+  for (const link of [{ rel: "provide_evidence", method: "GET", href: "https://example.com" }, { rel: "appeal", method: "POST", href: "https://example.com" }, { rel: "provide_evidence", method: "POST" }]) {
+    assert.equal(normalizeDisputeDetail({ dispute_id: caseId, links: [link] }).canProvideEvidence, false);
+  }
+});
+
+const blankEvidence: EvidenceInput = { notes: "", carrier: "", trackingNumber: "", refundReference: "", files: [] };
+const pdfEvidence = { name: "delivery.pdf", size: 1000, type: "application/pdf" };
+
+test("all nine baseline reasons are supported without treating reference options as seller requests", () => {
+  for (const reason of ["MERCHANDISE_OR_SERVICE_NOT_RECEIVED", "MERCHANDISE_OR_SERVICE_NOT_AS_DESCRIBED", "UNAUTHORISED", "CREDIT_NOT_PROCESSED", "DUPLICATE_TRANSACTION", "INCORRECT_AMOUNT", "PAYMENT_BY_OTHER_MEANS", "CANCELED_RECURRING_BILLING", "OTHER"]) {
+    const plan = getEvidencePlan({ reason, requestedEvidence: [] });
+    assert.ok(plan.baselineTypes.length >= 2);
+    assert.equal(plan.hasSellerRequest, false);
+    assert.ok(plan.rules.every((item) => !item.requested));
+  }
+  const plan = getEvidencePlan({ reason: "DUPLICATE_TRANSACTION", requestedEvidence: [] });
+  const assessment = assessEvidence(plan, { OTHER: { ...blankEvidence, notes: "The two invoices describe separate purchases." } }, true);
+  assert.equal(assessment.checks.length, 1);
+  assert.equal(assessment.checks[0].prepared, true);
+  assert.equal(assessment.canPreviewSubmission, false);
+});
+
+test("the actual seller evidence request overrides the reason's baseline options", () => {
+  const plan = getEvidencePlan({ reason: "MERCHANDISE_OR_SERVICE_NOT_RECEIVED", requestedEvidence: ["OTHER", "OTHER"] });
+  assert.deepEqual(plan.rules.map((item) => item.type), ["OTHER"]);
+  assert.ok(plan.hasSellerRequest);
+  const assessment = assessEvidence(plan, { OTHER: { ...blankEvidence, notes: "The item is available for collection." } }, true);
+  assert.equal(assessment.canPreviewSubmission, true);
+  assert.equal(assessEvidence(plan, { OTHER: { ...blankEvidence, files: [pdfEvidence] } }, false).canPreviewSubmission, false);
+});
+
+test("fulfillment evidence accepts alternatives for INR but requires tracking for unauthorized cases", () => {
+  const inrRule = getEvidencePlan({ reason: "MERCHANDISE_OR_SERVICE_NOT_RECEIVED", requestedEvidence: ["PROOF_OF_FULFILLMENT"] }).rules[0];
+  const unauthorizedRule = getEvidencePlan({ reason: "UNAUTHORISED", requestedEvidence: ["PROOF_OF_FULFILLMENT"] }).rules[0];
+  assert.equal(checkEvidence(inrRule, blankEvidence).prepared, false);
+  assert.equal(checkEvidence(inrRule, { ...blankEvidence, files: [pdfEvidence] }).prepared, true);
+  assert.equal(checkEvidence(inrRule, { ...blankEvidence, notes: "Customer collected the parcel; receipt attached separately." }).prepared, true);
+  assert.equal(checkEvidence(unauthorizedRule, { ...blankEvidence, files: [pdfEvidence] }).prepared, false);
+  assert.equal(checkEvidence(unauthorizedRule, { ...blankEvidence, carrier: "FedEx" }).prepared, false);
+  assert.equal(checkEvidence(unauthorizedRule, { ...blankEvidence, carrier: "FedEx", trackingNumber: "123456" }).prepared, true);
+});
+
+test("refund proof requires an existing refund reference and unknown evidence stays manual", () => {
+  const rule = getEvidencePlan({ reason: "CREDIT_NOT_PROCESSED", requestedEvidence: ["PROOF_OF_REFUND"] }).rules[0];
+  assert.equal(checkEvidence(rule, { ...blankEvidence, files: [pdfEvidence] }).prepared, false);
+  assert.equal(checkEvidence(rule, { ...blankEvidence, refundReference: "PAYPAL-REFUND" }).prepared, true);
+  const unknown = getEvidencePlan({ reason: "FUTURE_REASON", requestedEvidence: ["FUTURE_EVIDENCE"] }).rules[0];
+  assert.equal(checkEvidence(unknown, { ...blankEvidence, files: [pdfEvidence], notes: "Evidence." }).prepared, false);
+  assert.equal(checkEvidence(getEvidencePlan({ reason: "FUTURE_REASON", requestedEvidence: ["OTHER"] }).rules[0], { ...blankEvidence, notes: "Evidence." }).prepared, false);
+  assert.equal(checkEvidence(rule, { ...blankEvidence, refundReference: "PAYPAL-REFUND", notes: "a".repeat(2001) }).prepared, false);
+});
+
+test("file preparation checks official formats, strict individual limits, and the total across evidence categories", () => {
+  assert.equal(validateEvidenceFiles([], [pdfEvidence, { ...pdfEvidence, name: "DELIVERY.PNG", type: "image/png" }]).accepted.length, 2);
+  for (const file of [{ ...pdfEvidence, name: "evidence.exe" }, { ...pdfEvidence, type: "text/plain" }, { ...pdfEvidence, size: 0 }, { ...pdfEvidence, size: MAX_FILE_BYTES }]) {
+    assert.equal(validateEvidenceFiles([], [file]).accepted.length, 0);
+  }
+  assert.equal(validateEvidenceFiles([], [{ ...pdfEvidence, size: MAX_FILE_BYTES - 1 }]).accepted.length, 1);
+  const existing = [{ ...pdfEvidence, size: MAX_TOTAL_BYTES - 1000 }];
+  assert.equal(validateEvidenceFiles(existing, [pdfEvidence]).accepted.length, 1);
+  assert.equal(validateEvidenceFiles(existing, [{ ...pdfEvidence, size: 1001 }]).accepted.length, 0);
 });
 
 test("concurrent list/detail reads share OAuth and perform only read-only dispute requests", async () => {
