@@ -55,8 +55,11 @@ Other scripts: `npm run build` (production build), `npm run start` (serve the bu
 
 The home page (`/`) loads disputes from the configured PayPal Sandbox merchant.
 It selects the most recently updated dispute in the returned list page, then
-retrieves its full details. Use **Account disputes** to select another returned
-case, enter a dispute ID to query it directly, or refresh the account list.
+retrieves its full details. **Active cases** lists every dispute in that response
+with its ID, amount, reason, and status. Click a case to view its details, enter a
+dispute ID to query it directly, or refresh the list beside **Active cases**.
+Refreshing the list keeps the selected case if it is still present. On smaller
+screens the case list appears above the workspace.
 Amounts, status, messages, transactions, requested evidence, available actions,
 and the expandable raw response come from PayPal. Missing data stays unknown.
 

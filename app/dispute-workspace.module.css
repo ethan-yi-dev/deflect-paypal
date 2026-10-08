@@ -234,9 +234,37 @@
 .pipelineList strong { font-size: 13px; font-weight: 500; }
 .pipelineList p { color: #6b765f; font-size: 12px; margin-top: 4px; line-height: 1.7; }
 .demoStudioButton { display: flex; width: 100%; margin-top: 22px; }
+.liveSidebar { overflow-y: auto; }
+.liveSidebar > * { flex-shrink: 0; }
+.liveSidebar .sidebarBottom { padding-top: 28px; }
+.caseDirectory { margin-top: 22px; padding-top: 20px; border-top: 1px solid #3b5144; }
+.caseDirectoryHeading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
+.caseDirectoryHeading h2 { display: flex; align-items: center; gap: 7px; color: #b0c3b4; font-size: 10px; font-weight: 500; letter-spacing: 1.2px; }
+.caseDirectoryHeading h2 span { display: grid; place-items: center; min-width: 19px; padding: 1px 4px; border-radius: 4px; background: #365440; color: #d1ee98; font-size: 10px; letter-spacing: 0; }
+.caseListRefresh { display: grid; place-items: center; width: 27px; height: 27px; border: 1px solid #49634f; border-radius: 5px; color: #c0d2b8; background: #294737; }
+.caseListRefresh:hover { background: #365440; }
+.caseListRefresh:disabled { opacity: .5; }
+.caseList { display: grid; gap: 9px; margin: 0; padding: 0; list-style: none; }
+.caseListButton { display: grid; gap: 6px; width: 100%; padding: 12px; border: 1px solid #3c5946; border-radius: 8px; background: #264234; color: #e9f0e5; text-align: left; }
+.caseListButton:hover { background: #304e3c; border-color: #8da879; }
+.caseListButton[aria-pressed="true"] { border-color: #c7e793; background: #304e3c; box-shadow: inset 3px 0 #c7e793; }
+.caseListButton code { color: #c0d1b9; font-size: 10px; overflow-wrap: anywhere; }
+.caseListReason { display: flex; align-items: center; gap: 6px; font-size: 11px; }
+.caseListReason::before { content: ""; width: 5px; height: 5px; flex-shrink: 0; border-radius: 50%; background: #d0b46a; }
+.caseListButton strong { font-size: 18px; font-weight: 500; letter-spacing: -.3px; }
+.caseListStatus { color: #b0c3a8; font-size: 10px; line-height: 1.5; }
+.caseListEmpty { color: #b0c3a8; font-size: 12px; line-height: 1.8; }
 @media (max-width: 650px) { .topbarRight { gap: 12px; } .sourceSwitch { font-size: 10px !important; } .topbarRight .demoLabel { font-size: 10px; } .breadcrumb { gap: 6px; font-size: 11px; } .errorBanner { flex-wrap: wrap; } .errorBanner > button { margin-left: 32px; } .scenarioControl select { min-width: 0; flex: 1; max-width: 235px; } .liveBlockHeading .sourceLabel { font-size: 10px; } .messageMeta { flex-wrap: wrap; } .messageMeta > span:last-child { width: 100%; padding-left: 32px; } }
 @media (min-width: 1600px) { .content { padding-top: 45px; } .sidebar { width: 246px; padding-left: 25px; padding-right: 25px; } }
 @media (max-width: 1150px) { .sidebar { width: 188px; padding-left: 14px; padding-right: 14px; } .brand { font-size: 27px; } .content { padding: 30px 25px 20px; } .topbar { padding: 0 25px; } .panelHeader { padding-left: 17px; padding-right: 17px; } .panelBody { padding-left: 17px; padding-right: 17px; } .workspaceGrid { gap: 15px; } .smallMuted { font-size: 10px; } .summaryGrid > div { padding: 0 15px; } .actionButtons { flex-direction: column; align-items: stretch; } .messageMeta > span:last-child { font-size: 10px; } }
 @media (max-width: 950px) { .workspaceGrid { grid-template-columns: 1fr; } .actionButtons { flex-direction: row; } .controls { flex-wrap: wrap; } .caseCardTop { align-items: flex-start; } .caseCardTop > .badge { font-size: 10px; } .summaryGrid { grid-template-columns: 1fr 1fr; gap: 22px 0; } .summaryGrid > div:nth-child(3) { border-left: 0; padding-left: 0; } .pageHeading { align-items: flex-start; } .modePill { margin-top: 22px; font-size: 10px; padding: 6px 8px; } .pageHeading h1 { font-size: 28px; } }
 @media (max-width: 650px) { .app { display: block; } .sidebar { position: static; height: auto; width: 100%; padding: 15px 20px; flex-direction: row; align-items: center; gap: 15px; } .brand { font-size: 25px; padding: 0; } .brandMark { width: 26px; height: 30px; } .sidebarCaption, .sidebarCase, .sidebarBottom { display: none; } .nav { display: flex; margin: 0 0 0 auto; gap: 6px; } .nav a { padding: 8px 10px; font-size: 12px; gap: 6px; } .navCount, .nav a > svg:last-child { display: none; } .topbar { height: 50px; padding: 0 20px; } .topbarRight { gap: 10px; } .content { padding: 25px 18px 20px; } .pageHeading { margin-bottom: 22px; gap: 10px; } .pageHeading h1 { font-size: 27px; } .pageHeading p { font-size: 12px; max-width: 220px; } .eyebrow { font-size: 10px; } .modePill { display: none; } .caseCardTop { flex-wrap: wrap; padding: 18px; } .caseCardTop > .badge { margin-left: 54px; } .caseTitle h2 { font-size: 15px; } .summaryGrid { padding: 20px 18px; } .summaryGrid strong { font-size: 13px; } .summaryGrid strong.money { font-size: 25px; } .controls { gap: 12px; padding-top: 20px; } .caseForm { width: 100%; } .caseForm input { flex: 1; min-width: 0; } .scenarioControl { width: 100%; justify-content: space-between; } .notice { font-size: 11px; padding-bottom: 15px; } .panelHeader { min-height: 59px; } .panelBody { padding: 20px 17px 17px; } .tabs { padding: 0 17px; gap: 23px; } .factRow { font-size: 11px; gap: 12px; } .factRow dd { font-size: 11px; } .factRow dd code { font-size: 11px; } .complaint { padding: 13px; } .messageMeta > span:last-child { font-size: 10px; } .messageFooter { font-size: 10px; } .messageFooter > .badge { font-size: 10px; } .recommendation h3 { font-size: 18px; } .validationHeading > span { font-size: 10px; } .actionButtons { gap: 7px; } .primaryButton, .secondaryButton { padding: 8px 9px; font-size: 11px !important; } .auditBody { padding: 0 17px 8px; } .auditColumnLabels, .auditList li { grid-template-columns: 66px 1fr 67px; gap: 5px; } .auditList time { font-size: 10px; } .auditEvent { gap: 7px; } .auditEvent strong { font-size: 11px; } .auditEvent p { font-size: 10px; overflow-wrap: anywhere; } .auditList li > .badge { font-size: 10px; padding: 3px 5px; } .footer { font-size: 10px; gap: 10px; } .footer > span:last-child { text-align: right; } }
+@media (max-width: 650px) {
+  .liveSidebar { flex-wrap: wrap; overflow-y: visible; }
+  .caseDirectory { flex-basis: 100%; min-width: 0; margin-top: 0; padding-top: 12px; }
+  .caseDirectoryHeading { margin-bottom: 9px; }
+  .caseList { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .caseListButton { height: 100%; padding: 10px; }
+  .caseListButton strong { font-size: 16px; }
+}
 @media (prefers-reduced-motion: reduce) { .app button { transition: none; } }

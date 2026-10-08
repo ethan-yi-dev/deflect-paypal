@@ -52,6 +52,7 @@ type QueryEvent = { id: number; time: string; title: string; detail: string; fai
 
 export default function LiveDisputeWorkspace({ onShowDemo }: { onShowDemo: () => void }) {
   const [caseId, setCaseId] = useState("");
+  const [currentCaseId, setCurrentCaseId] = useState("");
   const [items, setItems] = useState<DisputeSummary[]>([]);
   const [result, setResult] = useState<DisputeDetailResult | null>(null);
   const [activeTab, setActiveTab] = useState("overview");
@@ -63,7 +64,7 @@ export default function LiveDisputeWorkspace({ onShowDemo }: { onShowDemo: () =>
   const requestRef = useRef<AbortController | null>(null);
   const eventRef = useRef(0);
 
-  const query = useCallback((id?: string) => {
+  const query = useCallback((id?: string, preferredId?: string) => {
     requestRef.current?.abort();
     const controller = new AbortController();
     requestRef.current = controller;
@@ -84,21 +85,25 @@ export default function LiveDisputeWorkspace({ onShowDemo }: { onShowDemo: () =>
         detail = firstResponse as DisputeDetailResult;
       } else {
         const list = firstResponse as DisputeListResult;
-        setItems(list.items);
+        const sortedItems = [...list.items].sort((a, b) => (Date.parse(b.updatedAt ?? "") || 0) - (Date.parse(a.updatedAt ?? "") || 0));
+        setItems(sortedItems);
         record("Dispute list retrieved", `${list.items.length} disputes returned by PayPal`);
-        // Select the most recently updated item in the returned page.
-        const selectedId = [...list.items].sort((a, b) => (Date.parse(b.updatedAt ?? "") || 0) - (Date.parse(a.updatedAt ?? "") || 0))[0]?.id;
+        // Keep the selected case on refresh; otherwise open the latest case.
+        const selectedId = sortedItems.find((item) => item.id === preferredId)?.id ?? sortedItems[0]?.id;
         if (!selectedId) {
           setCaseId("");
+          setCurrentCaseId("");
           setNotice("No disputes were returned for this Sandbox account. You can still enter a known dispute ID.");
           return;
         }
         setCaseId(selectedId);
+        setCurrentCaseId(selectedId);
         detail = await readApi<DisputeDetailResult>(`/api/disputes/${encodeURIComponent(selectedId)}`, controller.signal);
       }
       if (controller.signal.aborted) return;
       setResult(detail);
       setCaseId(detail.dispute.id);
+      setCurrentCaseId(detail.dispute.id);
       setNotice(`PayPal Sandbox data · retrieved ${date(detail.fetchedAt)} · read only`);
       record("Dispute details retrieved", `${detail.dispute.id} · ${label(detail.dispute.status)}`);
       record("Case facts displayed", `${detail.dispute.transactions.length} transactions · ${detail.dispute.messages.length} messages · ${detail.dispute.requestedEvidence.length} requested evidence types`);
@@ -114,13 +119,16 @@ export default function LiveDisputeWorkspace({ onShowDemo }: { onShowDemo: () =>
   }, []);
 
   function startQuery(id?: string) {
-    if (id) setCaseId(id);
+    if (id) {
+      setCaseId(id);
+      setCurrentCaseId(id);
+    }
     setLoading(true);
     setResult(null);
     setError("");
     setInputError("");
     setNotice(id ? "Fetching dispute details from PayPal Sandbox…" : "Loading the merchant's disputes from PayPal Sandbox…");
-    void query(id);
+    void query(id, currentCaseId);
   }
 
   useEffect(() => {
@@ -143,26 +151,35 @@ export default function LiveDisputeWorkspace({ onShowDemo }: { onShowDemo: () =>
   const merchant = transaction?.merchantName ?? "Sandbox merchant";
   const waiting = dispute?.status?.startsWith("WAITING_FOR_");
   const hasTracking = !!dispute?.tracking.length;
-  const selectedId = items.some((item) => item.id === caseId) ? caseId : "";
 
   return (
     <div className={styles.app}>
       <a className={styles.skipLink} href="#workspace">Skip to workspace</a>
-      <aside className={styles.sidebar} aria-label="Workspace navigation">
+      <aside className={`${styles.sidebar} ${styles.liveSidebar}`} aria-label="Workspace navigation">
         <a className={styles.brand} href="#workspace" aria-label="Deflect workspace">
           <span className={styles.brandMark}><Icon name="shield" size={24} /></span>deflect<span className={styles.brandDot}>.</span>
         </a>
         <span className={styles.sidebarCaption}>THE DISPUTE WORKSPACE</span>
         <nav className={styles.nav}>
-          <a className={styles.navActive} href="#workspace"><Icon name="grid" />Workspace<span className={styles.navCount}>01</span></a>
+          <a className={styles.navActive} href="#workspace"><Icon name="grid" />Workspace<span className={styles.navCount}>{String(items.length).padStart(2, "0")}</span></a>
           <a href="#audit"><Icon name="history" />Query history<Icon name="chevron" size={14} /></a>
         </nav>
-        <div className={styles.sidebarCase}>
-          <span className={styles.sidebarLabel}>ACTIVE CASE</span>
-          <div className={styles.caseDot}>{dispute ? label(dispute.reason) : loading ? "Loading dispute…" : "No case selected"}</div>
-          <code>{dispute?.id ?? "—"}</code>
-          <span className={styles.sidebarAmount}>{dispute?.amount?.value ?? "—"} <span>{dispute?.amount?.currency ?? ""}</span></span>
-        </div>
+        <section className={styles.caseDirectory} aria-labelledby="active-cases-title">
+          <div className={styles.caseDirectoryHeading}>
+            <h2 id="active-cases-title">ACTIVE CASES <span>{items.length}</span></h2>
+            <button className={styles.caseListRefresh} disabled={loading} onClick={() => startQuery()} aria-label="Refresh dispute list"><Icon name="refresh" size={14} /></button>
+          </div>
+          {items.length ? <ul className={styles.caseList}>
+            {items.map((item) => <li key={item.id}>
+              <button className={styles.caseListButton} aria-label={`View dispute ${item.id}`} aria-pressed={currentCaseId === item.id} onClick={() => startQuery(item.id)}>
+                <code>{item.id}</code>
+                <span className={styles.caseListReason}>{label(item.reason)}</span>
+                <strong>{money(item.amount)}</strong>
+                <span className={styles.caseListStatus}>{label(item.status)}</span>
+              </button>
+            </li>)}
+          </ul> : <p className={styles.caseListEmpty}>{loading ? "Loading account disputes…" : error ? "Could not load the account list. Refresh to try again." : "No disputes were returned for this account."}</p>}
+        </section>
         <div className={styles.sidebarBottom}>
           <div className={styles.safetyCard}>
             <Icon name="shield" size={22} /><strong>Evidence before action.</strong>
@@ -209,14 +226,6 @@ export default function LiveDisputeWorkspace({ onShowDemo }: { onShowDemo: () =>
               <input id="case-id" value={caseId} placeholder="Enter dispute ID" disabled={loading} onChange={(event) => { setCaseId(event.target.value); setInputError(""); }} aria-invalid={!!inputError} aria-describedby={inputError ? "case-error" : undefined} spellCheck={false} />
               <button className={styles.refreshButton} type="submit" disabled={loading} aria-label="Load dispute"><Icon name="refresh" size={15} /></button>
             </form>
-            <div className={styles.scenarioControl}>
-              <label htmlFor="account-disputes">Account disputes</label>
-              <select id="account-disputes" value={selectedId} disabled={loading || !items.length} onChange={(event) => { if (event.target.value) startQuery(event.target.value); }}>
-                <option value="">{loading ? "Loading…" : items.length ? "Select a dispute" : "No disputes listed"}</option>
-                {items.map((item) => <option key={item.id} value={item.id}>{item.id} · {money(item.amount)}</option>)}
-              </select>
-              <button className={styles.refreshButton} disabled={loading} onClick={() => startQuery()} aria-label="Refresh dispute list"><Icon name="refresh" size={15} /></button>
-            </div>
           </div>
           {inputError && <p id="case-error" role="alert" className={styles.inputError}>{inputError}</p>}
           <div className={styles.notice} role="status" aria-live="polite">{notice}</div>
