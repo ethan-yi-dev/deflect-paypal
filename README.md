@@ -1,17 +1,302 @@
-> [!TIP]
-> **PayPal AI Hackathon**
-> 
-> Win part of $69,750 in total prizes
-> 
-> Build What's Next with PayPal and AI is a global online hackathon inviting developers, designers, founders, students, and builders to create something new using PayPal and AI.
-> 
-> There are no prescribed problem statements and no set of tracks. Build an agent, an app, an automation, a new payment experience, a business tool, a social product, or something we haven't thought of yet.
-> 
-> https://paypalaihackathon.devpost.com
+# Deflect
 
-# PayPal SDK data pages
+A customer support workspace for PayPal disputes. Deflect brings the customer's
+concern, case dates, refund request, and evidence requirements into one page,
+then helps support staff prepare an evidence draft and review the next step.
 
-A Next.js app that reads sandbox data with the [PayPal TypeScript Server SDK](https://github.com/paypal/PayPal-TypeScript-Server-SDK) (`@paypal/paypal-server-sdk`) and shows it in simple tables.
+Built with Next.js, React, and TypeScript for the
+[PayPal AI Hackathon](https://paypalaihackathon.devpost.com).
+
+> **Current scope:** dispute queries use the configured PayPal Sandbox account.
+> Deflect assessment runs local evidence rules. PayPal submission is a local
+> preview. LLM recommendations, Policy/JEV validation, and real dispute actions
+> are planned integrations.
+
+## Current features
+
+| Feature | Current behavior |
+| --- | --- |
+| Dispute list | Queries the merchant's disputes and lists the returned cases in **Active cases**. |
+| Case selection | Opens the latest updated case by default; supports clicking another case, loading a known ID, and refreshing the list. |
+| Support details | Shows the initiator, conversation, dates, response deadline, amounts, related items, and requested evidence. |
+| Evidence preparation | Displays fields according to the dispute reason and the evidence requested from the seller. |
+| File selection | Validates local files, lists names and sizes, supports removal, and keeps drafts separate by case. |
+| Deflect assessment | Checks draft completeness and returns a rule-based suggestion about missing evidence or review steps. |
+| PayPal submission | Opens a review preview when the case offers evidence submission; sends no evidence or action requests. |
+| Demo studio | Offers three fixed scenarios with predefined recommendations, Policy/JEV results, and a simulated audit trail. |
+
+The support details use neutral cards. **Evidence & next steps** is a separate
+**ACTION WORKSPACE**, with a dark green header, highlighted border, and its own
+operation bar. The layout adapts to smaller screens, where cases appear above
+the details.
+
+## Run locally
+
+### Requirements
+
+- Node.js **20.9 or later** and npm.
+- A [PayPal Sandbox REST app](https://developer.paypal.com/dashboard/applications/sandbox)
+  with credentials for the merchant whose disputes you want to view.
+- Server access to `https://api-m.sandbox.paypal.com`.
+
+### Install and configure
+
+```bash
+npm install
+```
+
+Create `.env.local` from [env.example](env.example) if it does not already exist.
+Keep your existing `.env.local` when it is already configured.
+
+PowerShell:
+
+```powershell
+if (!(Test-Path .env.local)) { Copy-Item env.example .env.local }
+```
+
+Bash:
+
+```bash
+test -f .env.local || cp env.example .env.local
+```
+
+Fill in your Sandbox credentials:
+
+```dotenv
+PAYPAL_CLIENT_ID=your_sandbox_client_id
+PAYPAL_SECRET=your_sandbox_secret
+```
+
+These values are read on the server. Keep them without a `NEXT_PUBLIC_` prefix.
+The `.env.local` file is ignored by Git. Restart the dev server after changing
+credentials.
+
+### Start the application
+
+```bash
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000).
+
+One command starts the Next.js frontend and backend. The browser queries
+same-origin `/api/disputes` routes, and the server calls PayPal. This setup does
+not require a separate frontend server or browser CORS configuration for PayPal.
+
+Without credentials, live queries show a configuration error. You can still
+choose **View demo studio** to explore the fixed demo scenarios.
+
+## Using the workspace
+
+### 1. Select a dispute
+
+The home page first loads the account's dispute list, then opens the most
+recently updated case in that response. **Active cases** shows each returned
+case's reference, amount, reason, and status. Click a case to load its details,
+or use **Case reference** to query a known dispute ID directly.
+
+The refresh button beside **Active cases** reloads the list and keeps the
+selected case if it is still present. The current list query returns PayPal's
+first page only; automatic pagination and an account-wide search are not
+implemented.
+
+### 2. Read the customer context
+
+- **Dispute summary:** reason, status, amount, initiator, opening time, and seller response deadline.
+- **Customer's concern:** buyer/seller messages with author and time, requested refund amount, and related items.
+- **Response details:** case status guidance, requested evidence, PayPal's refund limit, and payment holds when present.
+- **Case activity:** opening time, last update, and seller response deadline in Pacific time (`America/Los_Angeles`).
+
+The initiator comes from case creation evidence. If that evidence is missing,
+it stays unknown. Missing information is not filled with demo data. Tracking
+supplied in the case is not treated as confirmed delivery; carrier lookups are
+not connected.
+
+Internal transaction and merchant IDs, fund movement history, API action names,
+and raw JSON are kept out of the support view. A case reference remains visible
+so support staff can identify the dispute.
+
+### 3. Prepare evidence and review the next step
+
+In **Evidence & next steps**:
+
+1. Review the evidence labeled **Requested by PayPal**. Fill the relevant carrier,
+   tracking, refund reference, or note fields.
+2. When **Submission available** is shown, choose files in **Add evidence files**.
+   The list shows each file's name, size, and **Not uploaded** status. Remove any
+   file you do not want to include.
+3. Click **Run Deflect assessment** to check the draft and see what to collect or
+   review next. Editing the draft clears the previous result. Switching or
+   refreshing cases also requires running the assessment again.
+4. Click **Submit evidence to PayPal** to review the local submission preview.
+   **Confirm preview** is enabled only when a seller request is present and the
+   required draft fields pass the basic check. Confirmation displays a local
+   notice; it does not contact PayPal.
+
+Files already returned by PayPal as seller-submitted documents appear separately
+under **Files already on PayPal**. Selecting a local file does not add it to that
+list.
+
+Notes and files stay in memory with each case while switching cases inside the
+live workspace. Reloading the page or switching to the demo studio clears those
+drafts. There is no database, server upload storage, or persistent draft saving.
+
+## Evidence rules
+
+The baseline follows PayPal's
+[dispute reasons and evidence guide](https://developer.paypal.com/platforms/disputes/reference/dispute-reasons/).
+It covers item not received, item not as described, unauthorized purchase,
+credit not processed, duplicate transaction, incorrect amount, payment by other
+means, canceled recurring billing, and other disputes.
+
+The actual case's evidence request takes precedence:
+
+- `reason` selects the baseline guidance.
+- Only `evidences[]` entries with `source: REQUESTED_FROM_SELLER` become seller requirements.
+- Their `evidence_type` values determine which fields are shown.
+- A POST link with `rel: provide_evidence` or `provide-evidence` and a nonempty `href` enables file selection and the submission preview.
+
+If no specific seller request is returned, the page labels the baseline entries
+**Reference option**. These are possible alternatives, not a requirement to
+submit every type. Unknown reasons or evidence types require manual review.
+
+| Evidence | Basic draft check |
+| --- | --- |
+| Fulfillment proof for item not received | Carrier and tracking, **or** an explanatory note or selected delivery document. |
+| Fulfillment proof for unauthorized purchase | Carrier and tracking; a file alone is insufficient. |
+| Refund proof | A reference for an already issued PayPal refund; a receipt alone is insufficient. |
+| Other supporting evidence | An explanatory note or selected document. |
+
+Notes are limited to 2,000 characters. The checker verifies the presence of draft
+fields; it does not authenticate documents, confirm delivery or refunds, or
+approve a financial action. A selected file can satisfy a draft check while its
+actual contents still need review.
+
+Providing evidence through `provide-evidence` and making a formal `appeal` are
+separate PayPal actions. The current preview prepares evidence submission;
+formal appeals are not implemented. See
+[PayPal's Disputes API guide](https://developer.paypal.com/platforms/disputes/handle-disputes/use-disputes-api/).
+
+### File limits
+
+Following PayPal's
+[supported file types and sizes](https://developer.paypal.com/platforms/disputes/reference/supported-file-types-sizes/):
+
+- JPG, JPEG, GIF, PNG, and PDF.
+- Nonempty files, each **smaller than 10 MB**.
+- Up to **50 MB total** across the selected files for a case.
+
+The local validator checks the extension, the MIME type when the browser supplies
+one, and file sizes. These checks do not validate the file contents.
+
+## Demo studio
+
+**View demo studio** switches to independent fixtures in
+[app/demo-dispute.ts](app/demo-dispute.ts). It works without PayPal credentials.
+
+| Scenario | Demonstrates |
+| --- | --- |
+| Missing tracking | An evidence gap and a predefined response. |
+| Delivery confirmed | A predefined response using explicitly fictional shipment data. |
+| Injection attempt | An unsafe proposal rejected by predefined Policy/JEV checks. |
+
+**Run demo analysis** replays the chosen scenario's fixed recommendation.
+**Preview action → Simulate action** adds a local audit entry. No LLM, message,
+evidence submission, or refund is executed. This demo is not an evaluation of a
+real case or a working Policy/JEV implementation.
+
+**View PayPal disputes** returns to live Sandbox queries. Failed live queries
+never fall back to the demo fixtures. Demo state resets when leaving the studio.
+
+## Backend and project structure
+
+```text
+Browser → Next.js /api/disputes → PayPal Sandbox Disputes REST API
+        → Local evidence rules and submission preview
+```
+
+| Endpoint | Response |
+| --- | --- |
+| `GET /api/disputes` | `items`, `fetchedAt`, and `environment: sandbox`; first list page only. |
+| `GET /api/disputes/{id}` | Normalized `dispute` details, `fetchedAt`, and `environment: sandbox`. |
+
+The Disputes client obtains and caches an OAuth token, shares concurrent token
+requests, and retries a GET once after a rejected token. IDs are validated before
+querying PayPal. Dispute responses use `private, no-store`, and provider errors
+are sanitized. Credentials and tokens are not returned to the browser. The
+Disputes client uses a fixed Sandbox host and never follows action links or
+performs dispute mutations.
+
+The API detail response retains operational fields for future backend work;
+the frontend chooses the customer support fields to display. There are no
+assessment, upload, execution, or appeal POST endpoints yet.
+
+| File | Responsibility |
+| --- | --- |
+| [app/live-dispute-workspace.tsx](app/live-dispute-workspace.tsx) | Live case list, customer context, selection, and case drafts. |
+| [app/dispute-evidence.tsx](app/dispute-evidence.tsx) | Evidence fields, local file lists, assessment results, and submission preview. |
+| [lib/dispute-evidence.ts](lib/dispute-evidence.ts) | Baseline evidence rules, draft checks, and file validation. |
+| [lib/disputes.ts](lib/disputes.ts) | Shared types and normalization of PayPal responses. |
+| [lib/paypal-disputes.ts](lib/paypal-disputes.ts) | Server-only facade and sanitized API error responses. |
+| [lib/paypal-disputes-client.ts](lib/paypal-disputes-client.ts) | OAuth and read-only Disputes REST requests. |
+| [app/dispute-workspace.tsx](app/dispute-workspace.tsx) | Mode switching and the static demo studio. |
+| [tests/paypal-disputes.test.ts](tests/paypal-disputes.test.ts) | Mocked API client, normalization, evidence, and file checks. |
+
+The original SDK pages remain available:
+
+| Route | Data source | Shows |
+| --- | --- | --- |
+| `/transactions` | `getRecentTransactions()` | First 20 transactions from the last 30 days. |
+| `/subscriptions` | `getBillingPlans()` | First 20 subscription billing plans. |
+| `/balances` | `getBalances()` | Current balance per currency. |
+
+These pages use [lib/paypal.ts](lib/paypal.ts) and the
+[PayPal TypeScript Server SDK](https://github.com/paypal/PayPal-TypeScript-Server-SDK).
+The transaction page additionally requires the app's **Transaction search**
+feature. Disputes use a separate REST client because the installed SDK does not
+expose a Disputes controller.
+
+## Development checks
+
+| Command | Purpose |
+| --- | --- |
+| `npm run dev` | Start the UI and API routes in development. |
+| `npm run lint` | Run ESLint. |
+| `npm run test:disputes` | Compile and run the mocked Disputes and evidence checks with Node's test runner. |
+| `npm run build` | Build the production application and check TypeScript. |
+| `npm run start` | Serve an existing production build. |
+
+The automated tests use mocked PayPal responses and do not need credentials or
+send live PayPal requests. They cover token sharing/refresh, query errors, ID
+validation, missing facts, seller evidence selection, baseline alternatives,
+unknown evidence, and file limits.
+
+## Troubleshooting
+
+| Symptom | Check |
+| --- | --- |
+| PayPal is not configured | Fill both values in `.env.local` and restart the dev server. |
+| Authentication or access error | Check the Sandbox credentials and the app/merchant's Disputes access. |
+| No cases listed | Confirm the configured merchant account; load a known dispute ID directly if needed. Only the first list page is queried. |
+| File selection or submission is unavailable | The current detail response has no applicable POST evidence link. |
+| Assessment requests more evidence | Follow the missing-field suggestions; refund and tracking evidence need their structured references where required. |
+| Preview confirmation is disabled | A specific seller request and complete draft fields are required. |
+| Files disappeared | Drafts are in-memory and reset on reload or when leaving the live workspace. |
+| Timeout or rate limit | Check server connectivity to PayPal; wait before retrying a rate-limited request. |
+
+## Planned integrations
+
+The intended flow is:
+
+```text
+Read dispute → Query order and carrier facts → LLM recommendation
+             → Policy / JEV validation → Execute action → Persist audit log
+```
+
+The current implementation covers dispute reads, evidence preparation, and local
+rule checks. Remaining work includes order/carrier queries, LLM integration,
+Policy/JEV validation, actual PayPal evidence submission or other actions,
+persistent drafts and audit logs, pagination, and application authentication.
 
 ## Origin and attribution
 
@@ -37,103 +322,10 @@ so this project's MIT license does **not** cover the inherited material or
 grant permission on behalf of its rights holders. Third-party dependencies
 and assets remain subject to their respective licenses.
 
-## Run locally
+## Starter SDK response examples
 
-Requires Node.js 20.9 or later and a PayPal sandbox REST app ([developer.paypal.com](https://developer.paypal.com/dashboard/applications/sandbox)). The Transaction Search pages also need the app's **Transaction search** feature enabled.
-
-```bash
-npm install
-cp env.example .env.local   # then fill in the values
-npm run dev
-```
-
-Open [http://localhost:3000](http://localhost:3000). Next.js only loads the dotted `.env.local`; it is git-ignored, so credentials stay out of the repo.
-
-Other scripts: `npm run build` (production build), `npm run start` (serve the build), `npm run lint`.
-
-## Deflect dispute workspace
-
-The home page (`/`) loads disputes from the configured PayPal Sandbox merchant.
-It selects the most recently updated dispute in the returned list page, then
-retrieves its full details. **Active cases** lists every dispute in that response
-with its ID, amount, reason, and status. Click a case to view its details, enter a
-dispute ID to query it directly, or refresh the list beside **Active cases**.
-Refreshing the list keeps the selected case if it is still present. On smaller
-screens the case list appears above the workspace.
-The case details focus on customer support: the concern and conversation,
-initiator, opened/updated times, seller response deadline, disputed and requested
-refund amounts, related items, and evidence requests. The initiator is taken from
-case creation evidence; it remains unknown when that evidence is missing.
-Payment identifiers, fund movement history, API action names, and raw JSON are
-kept out of the support view. Missing data stays unknown.
-
-Next.js serves both the frontend and these same-origin, read-only endpoints:
-
-- `GET /api/disputes`: the first list page returned by PayPal.
-- `GET /api/disputes/{id}`: current dispute details.
-
-`lib/paypal-disputes.ts` is a server-only facade around the Disputes REST client.
-It reads `PAYPAL_CLIENT_ID` and `PAYPAL_SECRET` from `.env.local`, obtains and
-caches an OAuth token, and retries a read once if the token is rejected.
-Credentials and tokens are never returned to the browser. Dispute queries
-and responses use `no-store`; provider errors are sanitized. The connection
-always uses `https://api-m.sandbox.paypal.com`. It does not execute dispute actions.
-
-Order/carrier lookups, AI recommendations, Policy/JEV checks, and persistent
-audit storage are not connected. Tracking supplied in case evidence is shown
-as unverified. **Case activity** shows the dispute's opened and updated times
-and seller response deadline in Pacific time.
-
-### Evidence preparation
-
-The support view includes a baseline check based on PayPal's
-[reason/evidence guide](https://developer.paypal.com/platforms/disputes/reference/dispute-reasons/).
-The specific `REQUESTED_FROM_SELLER` evidence types override the baseline;
-reference options are not all mandatory. Fulfillment, refund, and explanatory
-evidence show different fields. Unknown evidence types require manual review.
-The file picker and PayPal button depend on the presence of a POST
-`provide_evidence` / `provide-evidence` link. This action is distinct from `appeal`.
-
-Selected files appear with their names, sizes, and **Not uploaded** status.
-They stay in memory with the case's draft while switching cases; reloading
-clears them. Files already listed as seller submissions in the PayPal response
-appear separately. Files must be JPG/JPEG, GIF, PNG, or PDF, individually smaller
-than 10 MB, with up to 50 MB total, following the
-[official file requirements](https://developer.paypal.com/platforms/disputes/reference/supported-file-types-sizes/).
-This local validation checks format and size, not document authenticity.
-
-**Run Deflect assessment** currently checks draft fields with the baseline rules
-and suggests what to collect or review. It does not call an LLM or grant
-Policy/JEV approval. **Submit evidence to PayPal** opens a local review preview;
-confirming it sends no files or PayPal requests. Both actions are ready for
-future API integration. The existing backend remains read-only.
-
-**View demo studio** opens the separate hardcoded fixtures in
-`app/demo-dispute.ts`. Demo data is never substituted for a failed PayPal query.
-
-Select **Missing tracking**, **Delivery confirmed**, or **Injection attempt**
-to explore the predefined scenarios. **Run demo analysis** replays a fixed
-recommendation. **Preview action → Simulate action** adds an in-memory audit
-entry; no message, evidence, or refund is sent. The delivery scenario uses
-explicitly fictional shipment data. **View PayPal disputes** returns to real
-Sandbox queries. The demo studio can run without PayPal credentials.
-
-Start with `npm run dev`, then open `http://localhost:3000`.
-The original live SDK pages remain available at `/transactions`,
-`/subscriptions`, and `/balances` and require configured PayPal credentials.
-Run `npm run test:disputes` for the mocked Disputes client and normalization checks.
-
-## How it works
-
-Every SDK call lives in [`lib/paypal.ts`](lib/paypal.ts), which owns the sandbox `Client`. Each original data page is a server component that calls one of those functions and renders the result with [`app/data-table.tsx`](app/data-table.tsx). These data pages call `await connection()` so they render per request with live data instead of being prerendered at build time. The dispute workspace uses a separate REST client because the installed Server SDK does not expose the Disputes API.
-
-## Data pages
-
-| Page | `lib/paypal.ts` function | SDK call | Shows |
-|---|---|---|---|
-| [`/transactions`](app/transactions/page.tsx) | `getRecentTransactions()` | `TransactionSearchController.searchTransactions` | First 20 transactions from the last 30 days |
-| [`/subscriptions`](app/subscriptions/page.tsx) | `getBillingPlans()` | `SubscriptionsController.listBillingPlans` | First 20 subscription billing plans |
-| [`/balances`](app/balances/page.tsx) | `getBalances()` | `TransactionSearchController.searchBalances` | Current balance per currency |
+<details>
+<summary>Expand the original Sandbox response examples</summary>
 
 The examples below are real sandbox responses as the SDK returns them (camelCase fields, not the REST API's snake_case).
 
@@ -253,3 +445,5 @@ One `plans` item (a plan with a 30-day trial):
   "lastRefreshTime": "2026-09-28T10:59:59Z"
 }
 ```
+
+</details>
