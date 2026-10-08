@@ -51,9 +51,27 @@ Open [http://localhost:3000](http://localhost:3000). Next.js only loads the dott
 
 Other scripts: `npm run build` (production build), `npm run start` (serve the build), `npm run lint`.
 
+## Deflect frontend preview
+
+The home page (`/`) is a single-page dispute workspace with a case summary,
+customer complaint, payment and fulfillment facts, suggested actions,
+Policy/JEV results, action previews, and an audit trail. It uses hardcoded
+fixtures in `app/demo-dispute.ts`; it does not call PayPal or an AI service.
+The frontend preview can run without PayPal credentials and uses system fonts.
+
+Select **Missing tracking**, **Delivery confirmed**, or **Injection attempt**
+to explore the predefined scenarios. **Run demo analysis** replays a fixed
+recommendation. **Preview action → Simulate action** adds an in-memory audit
+entry; no message, evidence, or refund is sent. Reloading resets the demo.
+The delivery scenario uses explicitly fictional shipment data.
+
+Start with `npm run dev`, then open `http://localhost:3000`.
+The original live SDK pages remain available at `/transactions`,
+`/subscriptions`, and `/balances` and require configured PayPal credentials.
+
 ## How it works
 
-Every SDK call lives in [`lib/paypal.ts`](lib/paypal.ts), which owns the sandbox `Client`. Each page is a server component that calls one of those functions and renders the result with [`app/data-table.tsx`](app/data-table.tsx). Pages call `await connection()` so they render per request with live data instead of being prerendered at build time.
+Every SDK call lives in [`lib/paypal.ts`](lib/paypal.ts), which owns the sandbox `Client`. Each original data page is a server component that calls one of those functions and renders the result with [`app/data-table.tsx`](app/data-table.tsx). These data pages call `await connection()` so they render per request with live data instead of being prerendered at build time. The home-page frontend preview is independent of this SDK integration.
 
 ## Data pages
 
