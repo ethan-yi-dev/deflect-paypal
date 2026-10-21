@@ -19,6 +19,7 @@ export type KnowledgeDocument = {
   indexedAt: string | null;
 };
 export type KnowledgeWriteResult = { document: KnowledgeDocument; changed: boolean; operation: "created" | "updated" | "unchanged"; message: string };
+export type KnowledgeDeleteResult = { id: string; deletedAt: string; message: string };
 export type KnowledgeList = { knowledgeBase: ModelBinding; documents: KnowledgeDocument[] };
 export type ParsedPage = { pageNumber: number; text: string };
 export type KnowledgeChunk = ParsedPage & { embedding: number[] };

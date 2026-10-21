@@ -3,6 +3,16 @@ import { knowledgeErrorResponse, knowledgeHeaders, knowledgeRepository, requireS
 
 export const runtime = "nodejs";
 
+export async function DELETE(request: Request, context: { params: Promise<{ id: string }> }) {
+  try {
+    requireSameOrigin(request);
+    const { id } = await context.params;
+    validateDocId(id);
+    const result = await knowledgeRepository().deleteDocument(id);
+    return Response.json(result, { headers: knowledgeHeaders });
+  } catch (error) { return knowledgeErrorResponse(error); }
+}
+
 export async function PUT(request: Request, context: { params: Promise<{ id: string }> }) {
   try {
     requireSameOrigin(request);

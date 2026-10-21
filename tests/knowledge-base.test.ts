@@ -373,3 +373,138 @@ test("HTTP input accepts multipart and JSON text, requires current hashes, and r
   assert.throws(() => prepareFile("bad.txt", Buffer.from([0xff, 0xfe])), { code: "INVALID_TEXT" });
   await assert.rejects(readDocumentSource(new Request("http://localhost/api", { method: "POST", headers: { "Content-Type": "application/json" }, body: "not json" })), { code: "INVALID_UPLOAD" });
 });
+
+test("soft deletion retains the source, exact chunks, vectors, and job history but excludes them from retrieval", async () => {
+  const repo = repository();
+  const removed = await repo.upload("removed.pdf", pdf);
+  const kept = await repo.upload("kept.pdf", pdf);
+  for (const document of [removed, kept]) {
+    await repo.startIndexing(document.id);
+    await processNextKnowledgeJob(repo, providers());
+  }
+  const originalChunks = await db.query("SELECT * FROM t_knowledge_chunk WHERE doc_id=$1 ORDER BY chunk_index", [removed.id]);
+  const originalJobs = await db.query("SELECT * FROM t_knowledge_job WHERE doc_id=$1", [removed.id]);
+  assert.equal((await repo.search(values(), repo.binding, 10)).length, 4);
+
+  const result = await repo.deleteDocument(removed.id);
+  assert.equal(result.id, removed.id);
+  assert.ok(result.deletedAt);
+  const [stored] = await db.query<{ pdf_data: Uint8Array; status: string; chunk_count: number; deleted_at: Date }>("SELECT * FROM t_knowledge_document WHERE id=$1", [removed.id]);
+  assert.deepEqual(Buffer.from(stored.pdf_data), pdf);
+  assert.equal(stored.status, "success");
+  assert.equal(stored.chunk_count, 2);
+  assert.equal(stored.deleted_at.toISOString(), result.deletedAt);
+  assert.deepEqual(await db.query("SELECT * FROM t_knowledge_chunk WHERE doc_id=$1 ORDER BY chunk_index", [removed.id]), originalChunks);
+  assert.deepEqual(await db.query("SELECT * FROM t_knowledge_job WHERE doc_id=$1", [removed.id]), originalJobs);
+  assert.deepEqual((await repo.list()).documents.map((document) => document.id), [kept.id]);
+  const hits = await repo.search(values(), repo.binding, 10);
+  assert.equal(hits.length, 2);
+  assert.ok(hits.every((hit) => hit.docId === kept.id));
+  await assert.rejects(repo.source(removed.id), { code: "DOCUMENT_NOT_FOUND" });
+  await assert.rejects(repo.pdf(removed.id), { code: "DOCUMENT_NOT_FOUND" });
+  await assert.rejects(repo.updateDocument(removed.id, prepareFile("removed.pdf", pdf), removed.contentHash), { code: "DOCUMENT_NOT_FOUND" });
+  await assert.rejects(repo.startIndexing(removed.id), { code: "DOCUMENT_NOT_FOUND" });
+});
+
+test("soft deletion is idempotent, scoped to the base, and also accepts pending or failed documents", async () => {
+  const repo = repository();
+  const document = await repo.upload("pending.pdf", pdf);
+  await assert.rejects(repository().deleteDocument(document.id), { code: "DOCUMENT_NOT_FOUND" });
+  await assert.rejects(repo.deleteDocument(randomUUID()), { code: "DOCUMENT_NOT_FOUND" });
+  assert.equal((await repo.list()).documents.length, 1);
+  const first = await repo.deleteDocument(document.id);
+  const [before] = await db.query("SELECT * FROM t_knowledge_document WHERE id=$1", [document.id]);
+  assert.deepEqual(await repo.deleteDocument(document.id), first);
+  assert.deepEqual((await db.query("SELECT * FROM t_knowledge_document WHERE id=$1", [document.id]))[0], before);
+  const failed = await repo.upload("failed.pdf", pdf);
+  await repo.startIndexing(failed.id);
+  await processNextKnowledgeJob(repo, providers({ parse: async () => { throw new Error("Parse unavailable"); } }));
+  await repo.deleteDocument(failed.id);
+  assert.deepEqual((await repo.list()).documents, []);
+});
+
+test("uploading a deleted name creates a new pending identity without reusing its retained vectors", async () => {
+  const repo = repository();
+  const original = await repo.upload("policy.pdf", pdf);
+  await repo.startIndexing(original.id);
+  await processNextKnowledgeJob(repo, providers());
+  await repo.deleteDocument(original.id);
+  const created = await repo.createDocument(prepareFile("policy.pdf", pdf));
+  assert.equal(created.operation, "created");
+  assert.notEqual(created.document.id, original.id);
+  assert.equal(created.document.status, "pending");
+  assert.equal(created.document.sourceVersion, 1);
+  assert.deepEqual(await repo.search(values(), repo.binding, 5), []);
+  assert.equal((await repo.createDocument(prepareFile("policy.pdf", pdf))).document.id, created.document.id);
+  await repo.deleteDocument(created.document.id);
+  const changed = await repo.createDocument(prepareFile("policy.pdf", Buffer.from("%PDF-1.7\nDifferent policy")));
+  assert.equal(changed.operation, "created");
+  assert.notEqual(changed.document.id, original.id);
+  const [chunks] = await db.query<{ count: number }>("SELECT count(*)::int AS count FROM t_knowledge_chunk WHERE doc_id=$1", [original.id]);
+  assert.equal(chunks.count, 2);
+});
+
+test("deleted queued jobs settle without calling providers", async () => {
+  const repo = repository();
+  const document = await repo.upload("policy.pdf", pdf);
+  await repo.startIndexing(document.id);
+  await repo.deleteDocument(document.id);
+  let calls = 0;
+  await processNextKnowledgeJob(repo, providers({ parse: async () => { calls++; return []; }, embed: async () => { calls++; return values(); } }));
+  assert.equal(calls, 0);
+  assert.equal(await repo.claimJob(), null);
+  const [job] = await db.query<{ state: string; failed_step: string }>("SELECT state, failed_step FROM t_knowledge_job WHERE doc_id=$1", [document.id]);
+  assert.equal(job.state, "failed");
+  assert.equal(job.failed_step, "load");
+  const [stored] = await db.query<{ status: string; deleted_at: Date; active_run_id: string | null }>("SELECT status, deleted_at, active_run_id FROM t_knowledge_document WHERE id=$1", [document.id]);
+  assert.equal(stored.status, "failed");
+  assert.ok(stored.deleted_at);
+  assert.equal(stored.active_run_id, null);
+  assert.deepEqual((await repo.list()).documents, []);
+});
+
+test("a worker cannot load, renew, or commit a document removed during processing", async () => {
+  const repo = repository();
+  const document = await repo.upload("policy.pdf", pdf);
+  await repo.startIndexing(document.id);
+  const job = (await repo.claimJob())!;
+  await repo.loadJobDocument(job);
+  await repo.deleteDocument(document.id);
+  await assert.rejects(repo.loadJobDocument(job), { code: "STALE_JOB" });
+  await assert.rejects(repo.renewLease(job), { code: "JOB_LEASE_LOST" });
+  await assert.rejects(repo.completeJob(job, [{ text: "Must not be stored", pageNumber: 1, embedding: values() }]), { code: "STALE_JOB" });
+  await repo.failJob(job, "Document removed");
+  assert.deepEqual(await db.query("SELECT id FROM t_knowledge_chunk WHERE doc_id=$1", [document.id]), []);
+  assert.deepEqual(await repo.search(values(), repo.binding, 5), []);
+  assert.deepEqual((await repo.list()).documents, []);
+});
+
+test("deletion during embedding cannot publish new vectors or reactivate the document", async () => {
+  const repo = repository();
+  const document = await repo.upload("policy.pdf", pdf);
+  await repo.startIndexing(document.id);
+  await processNextKnowledgeJob(repo, providers({ embed: async () => {
+    await repo.deleteDocument(document.id);
+    return values();
+  } }));
+  const [job] = await db.query<{ state: string; failed_step: string }>("SELECT state, failed_step FROM t_knowledge_job WHERE doc_id=$1", [document.id]);
+  assert.equal(job.state, "failed");
+  assert.equal(job.failed_step, "store");
+  assert.deepEqual(await db.query("SELECT id FROM t_knowledge_chunk WHERE doc_id=$1", [document.id]), []);
+  assert.deepEqual((await repo.list()).documents, []);
+  assert.deepEqual(await repo.search(values(), repo.binding, 5), []);
+});
+
+test("all migrations can be reapplied with retained same-name documents", async () => {
+  const repo = repository();
+  const removed = await repo.upload("policy.pdf", pdf);
+  await repo.deleteDocument(removed.id);
+  const active = await repo.upload("policy.pdf", pdf);
+  const before = await db.query("SELECT * FROM t_knowledge_document WHERE knowledge_base_id=$1 ORDER BY id", [repo.binding.id]);
+  for (const name of (await readdir("db/migrations")).filter((name) => name.endsWith(".sql")).sort()) {
+    await pg.exec(await readFile(`db/migrations/${name}`, "utf8"));
+  }
+  assert.deepEqual(await db.query("SELECT * FROM t_knowledge_document WHERE knowledge_base_id=$1 ORDER BY id", [repo.binding.id]), before);
+  assert.deepEqual((await repo.list()).documents.map((document) => document.id), [active.id]);
+  await assert.rejects(repo.createDocument(prepareFile("policy.pdf", Buffer.from("%PDF-1.7\nChanged"))), { code: "DOCUMENT_EXISTS" });
+});

@@ -54,6 +54,9 @@
 .listError { margin: 16px 24px; padding: 12px; border: 1px solid #f2d9d2; border-radius: 6px; background: #fcf0ed; color: #ad5845; font-size: 12px; }
 .notice { margin-top: 14px; font-size: 12px; color: #55723e; }
 .indexButton { white-space: nowrap; }
+.deleteButton { color: #ad5845; border-color: #ecd6cf; white-space: nowrap; }
+.deleteButton:hover:not(:disabled) { background: #fcf0ed; border-color: #d8aaa0; }
+.deleteHint { padding: 12px 24px; border-top: 1px solid #edf0e9; color: #87957b; font-size: 11px; line-height: 1.7; }
 .searchBody { padding: 24px; }
 .searchForm { display: flex; align-items: stretch; gap: 12px; }
 .searchForm input { min-width: 0; flex: 1; padding: 10px 13px; border: 1px solid #dce5d2; border-radius: 6px; color: #344d2f; font-size: 13px; }
@@ -75,6 +78,7 @@
   .searchBody { padding: 17px; }
   .searchForm { flex-direction: column; }
   .modelNote { padding-left: 17px; padding-right: 17px; }
+  .deleteHint { padding-left: 17px; padding-right: 17px; }
   .sections { gap: 20px; }
   .uploadBody { padding: 17px; }
   .dropzone { min-height: 270px; padding: 25px 15px; }

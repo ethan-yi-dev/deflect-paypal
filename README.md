@@ -150,7 +150,10 @@ to queue indexing; the status becomes `running`, then `success` or `failed`.
 **Retry chunking** retries a failed document, and **Reindex** replaces an existing
 document's chunks. **Update** replaces a document by ID: matching SHA-256 returns
 **No changes**; changed content removes old vectors and returns to `pending` for
-manual rebuilding. Only successful documents participate in **Search your knowledge**.
+manual rebuilding. **Delete** soft-deletes a document: its original content,
+chunks, vectors, and job history stay in PostgreSQL, while the document disappears
+from the list and all retrieval results. The same name can be uploaded again as a
+new document. Only successful, active documents participate in **Search your knowledge**.
 
 Run the PostgreSQL migration and the separate worker before indexing. The full
 [knowledge-base guide](documents/knowledge-base.md) explains configuration, tables,

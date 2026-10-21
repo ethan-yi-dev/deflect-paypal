@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { assertBinding, KnowledgeError } from "./config";
 import type { Database, Sql } from "./database";
 import { prepareFile, type DocumentSource } from "./document-source";
-import type { KnowledgeChunk, KnowledgeContentType, KnowledgeDocument, KnowledgeStatus, KnowledgeWriteResult, ModelBinding, SearchHit } from "./types";
+import type { KnowledgeChunk, KnowledgeContentType, KnowledgeDeleteResult, KnowledgeDocument, KnowledgeStatus, KnowledgeWriteResult, ModelBinding, SearchHit } from "./types";
 
 type DocumentRow = {
   id: string; name: string; size: number; status: KnowledgeStatus; embedding_model: string;
@@ -39,7 +39,7 @@ export class KnowledgeRepository {
 
   async list() {
     const knowledgeBase = await this.ensureBase();
-    const rows = await this.db.query<DocumentRow>(`SELECT ${documentColumns} FROM t_knowledge_document WHERE knowledge_base_id=$1 ORDER BY created_at DESC, id`, [knowledgeBase.id]);
+    const rows = await this.db.query<DocumentRow>(`SELECT ${documentColumns} FROM t_knowledge_document WHERE knowledge_base_id=$1 AND deleted_at IS NULL ORDER BY created_at DESC, id`, [knowledgeBase.id]);
     return { knowledgeBase, documents: rows.map(documentDto) };
   }
 
@@ -52,10 +52,11 @@ export class KnowledgeRepository {
       const b = await this.ensureBase(sql);
       const [row] = await sql<DocumentRow>(`INSERT INTO t_knowledge_document
         (id, knowledge_base_id, name, size, pdf_data, text_content, content_type, content_hash, embedding_model, embedding_dimensions)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (knowledge_base_id, name) DO NOTHING RETURNING ${documentColumns}`,
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (knowledge_base_id, name) WHERE deleted_at IS NULL DO NOTHING RETURNING ${documentColumns}`,
       [randomUUID(), b.id, source.name, source.size, source.pdf, source.text, source.contentType, source.hash, b.embeddingModel, b.embeddingDimensions]);
       if (row) return { document: documentDto(row), changed: true, operation: "created", message: "Document uploaded as pending." };
-      const [existing] = await sql<DocumentRow>(`SELECT ${documentColumns} FROM t_knowledge_document WHERE knowledge_base_id=$1 AND name=$2 FOR UPDATE`, [b.id, source.name]);
+      const [existing] = await sql<DocumentRow>(`SELECT ${documentColumns} FROM t_knowledge_document WHERE knowledge_base_id=$1 AND name=$2 AND deleted_at IS NULL FOR UPDATE`, [b.id, source.name]);
+      if (!existing) throw new KnowledgeError("DOCUMENT_CHANGED", "This document was removed during upload. Try uploading it again.", 409);
       if (existing.content_hash === source.hash) return { document: documentDto(existing), changed: false, operation: "unchanged", message: "No changes. Existing content and vectors were kept." };
       throw new KnowledgeError("DOCUMENT_EXISTS", "A document with this name already exists. Use its Update action to replace it by document ID.", 409);
     });
@@ -64,7 +65,7 @@ export class KnowledgeRepository {
   async updateDocument(docId: string, source: DocumentSource, expectedHash: string): Promise<KnowledgeWriteResult> {
     return this.db.transaction(async (sql) => {
       const b = await this.ensureBase(sql);
-      const [existing] = await sql<DocumentRow>(`SELECT ${documentColumns} FROM t_knowledge_document WHERE id=$1 AND knowledge_base_id=$2 FOR UPDATE`, [docId, b.id]);
+      const [existing] = await sql<DocumentRow>(`SELECT ${documentColumns} FROM t_knowledge_document WHERE id=$1 AND knowledge_base_id=$2 AND deleted_at IS NULL FOR UPDATE`, [docId, b.id]);
       if (!existing) throw new KnowledgeError("DOCUMENT_NOT_FOUND", "Document not found.", 404);
       // An identical upload is a no-op even while indexing; it must not alter the job.
       if (existing.content_hash === source.hash) return { document: documentDto(existing), changed: false, operation: "unchanged", message: "No changes. Existing content and vectors were kept." };
@@ -81,17 +82,25 @@ export class KnowledgeRepository {
     });
   }
 
+  async deleteDocument(docId: string): Promise<KnowledgeDeleteResult> {
+    const [row] = await this.db.query<{ id: string; deleted_at: Date | string }>(`UPDATE t_knowledge_document
+      SET deleted_at=COALESCE(deleted_at, now()), updated_at=CASE WHEN deleted_at IS NULL THEN now() ELSE updated_at END
+      WHERE id=$1 AND knowledge_base_id=$2 RETURNING id, deleted_at`, [docId, this.binding.id]);
+    if (!row) throw new KnowledgeError("DOCUMENT_NOT_FOUND", "Document not found.", 404);
+    return { id: row.id, deletedAt: new Date(row.deleted_at).toISOString(), message: "Document removed from the knowledge base. Its source, chunks, and vectors are retained and excluded from search." };
+  }
+
   async startIndexing(docId: string) {
     return this.db.transaction(async (sql) => {
       const b = await this.ensureBase(sql);
       const runId = randomUUID();
       // Atomic CAS: concurrent requests recheck this predicate after row-lock waits.
       const [row] = await sql<DocumentRow>(`UPDATE t_knowledge_document SET status='running', active_run_id=$3,
-        error_message=NULL, chunk_count=0, indexed_at=NULL, updated_at=now() WHERE id=$1 AND knowledge_base_id=$2 AND status <> 'running'
+        error_message=NULL, chunk_count=0, indexed_at=NULL, updated_at=now() WHERE id=$1 AND knowledge_base_id=$2 AND deleted_at IS NULL AND status <> 'running'
         AND embedding_model=$4 AND embedding_dimensions=$5 RETURNING ${documentColumns}`,
       [docId, b.id, runId, b.embeddingModel, b.embeddingDimensions]);
       if (!row) {
-        const existing = await sql("SELECT id FROM t_knowledge_document WHERE id=$1 AND knowledge_base_id=$2", [docId, b.id]);
+        const existing = await sql("SELECT id FROM t_knowledge_document WHERE id=$1 AND knowledge_base_id=$2 AND deleted_at IS NULL", [docId, b.id]);
         throw new KnowledgeError(existing.length ? "ALREADY_RUNNING" : "DOCUMENT_NOT_FOUND", existing.length ? "This document is already running. Wait for it to finish." : "Document not found.", existing.length ? 409 : 404);
       }
       // Status and durable job are committed together; no fire-and-forget request task.
@@ -102,6 +111,8 @@ export class KnowledgeRepository {
   }
 
   async claimJob(): Promise<ClaimedJob | null> {
+    // Claim removed documents' queued jobs too: loadJobDocument rejects them
+    // before any provider call, and the worker settles them as failed.
     const [job] = await this.db.query<{ id: string; doc_id: string }>(`WITH next_job AS (
       SELECT j.id FROM t_knowledge_job j JOIN t_knowledge_document d ON d.id=j.doc_id
       WHERE j.state='queued' AND d.knowledge_base_id=$1 ORDER BY j.created_at
@@ -113,14 +124,16 @@ export class KnowledgeRepository {
 
   async renewLease(job: ClaimedJob) {
     const rows = await this.db.query(`UPDATE t_knowledge_job SET lease_until=now() + interval '2 minutes'
-      WHERE id=$1 AND state='working' AND lease_until > now() RETURNING id`, [job.id]);
+      WHERE id=$1 AND state='working' AND lease_until > now()
+      AND EXISTS (SELECT 1 FROM t_knowledge_document d WHERE d.id=t_knowledge_job.doc_id AND d.deleted_at IS NULL)
+      RETURNING id`, [job.id]);
     if (!rows.length) throw new KnowledgeError("JOB_LEASE_LOST", "The worker lease expired. Retry indexing.", 409);
   }
 
   async loadJobDocument(job: ClaimedJob) {
     await this.ensureBase();
     const [row] = await this.db.query<{ name: string; pdf_data: Uint8Array | null; text_content: string | null; content_type: KnowledgeContentType; embedding_model: string; embedding_dimensions: number }>(`SELECT d.name, d.pdf_data, d.text_content, d.content_type, d.embedding_model, d.embedding_dimensions FROM t_knowledge_document d JOIN t_knowledge_job j ON j.id=d.active_run_id
-      WHERE d.id=$1 AND d.active_run_id=$2 AND d.status='running' AND d.knowledge_base_id=$3 AND j.source_hash=d.content_hash`, [job.docId, job.id, this.binding.id]);
+      WHERE d.id=$1 AND d.active_run_id=$2 AND d.status='running' AND d.deleted_at IS NULL AND d.knowledge_base_id=$3 AND j.source_hash=d.content_hash`, [job.docId, job.id, this.binding.id]);
     if (!row) throw new KnowledgeError("STALE_JOB", "This indexing attempt is no longer active.", 409);
     assertBinding({ id: this.binding.id, embeddingModel: row.embedding_model, embeddingDimensions: row.embedding_dimensions }, this.binding);
     return { name: row.name, pdf: row.pdf_data, text: row.text_content, contentType: row.content_type };
@@ -132,7 +145,7 @@ export class KnowledgeRepository {
     await this.db.transaction(async (sql) => {
       const b = await this.ensureBase(sql);
       const [lease] = await sql<{ source_hash: string }>("SELECT source_hash FROM t_knowledge_job WHERE id=$1 AND state='working' AND lease_until > now() FOR UPDATE", [job.id]);
-      const active = await sql("SELECT id FROM t_knowledge_document WHERE id=$1 AND active_run_id=$2 AND status='running' AND knowledge_base_id=$3 AND content_hash=$4 FOR UPDATE", [job.docId, job.id, b.id, lease?.source_hash ?? ""]);
+      const active = await sql("SELECT id FROM t_knowledge_document WHERE id=$1 AND active_run_id=$2 AND status='running' AND deleted_at IS NULL AND knowledge_base_id=$3 AND content_hash=$4 FOR UPDATE", [job.docId, job.id, b.id, lease?.source_hash ?? ""]);
       if (!lease || !active.length) throw new KnowledgeError("STALE_JOB", "A stale worker cannot overwrite this document.", 409);
       await sql("DELETE FROM t_knowledge_chunk WHERE doc_id=$1", [job.docId]);
       for (const [index, chunk] of chunks.entries()) {
@@ -165,14 +178,14 @@ export class KnowledgeRepository {
   }
 
   async pdf(docId: string) {
-    const [row] = await this.db.query<{ name: string; pdf_data: Uint8Array }>("SELECT name, pdf_data FROM t_knowledge_document WHERE id=$1 AND knowledge_base_id=$2", [docId, this.binding.id]);
+    const [row] = await this.db.query<{ name: string; pdf_data: Uint8Array }>("SELECT name, pdf_data FROM t_knowledge_document WHERE id=$1 AND knowledge_base_id=$2 AND deleted_at IS NULL", [docId, this.binding.id]);
     if (!row) throw new KnowledgeError("DOCUMENT_NOT_FOUND", "Document not found.", 404);
     return row;
   }
 
   async source(docId: string) {
     const [row] = await this.db.query<{ name: string; content_type: KnowledgeContentType; source_data: Uint8Array }>(`SELECT name, content_type, COALESCE(pdf_data, convert_to(text_content, 'UTF8')) AS source_data
-      FROM t_knowledge_document WHERE id=$1 AND knowledge_base_id=$2`, [docId, this.binding.id]);
+      FROM t_knowledge_document WHERE id=$1 AND knowledge_base_id=$2 AND deleted_at IS NULL`, [docId, this.binding.id]);
     if (!row) throw new KnowledgeError("DOCUMENT_NOT_FOUND", "Document not found.", 404);
     return row;
   }
@@ -189,7 +202,7 @@ export class KnowledgeRepository {
       FROM t_knowledge_chunk c JOIN t_knowledge_document d ON d.id=c.doc_id
       WHERE c.knowledge_base_id=$2 AND c.embedding_model=$3 AND c.embedding_dimensions=$4
       ${b.embeddingDimensions === 768 ? "AND c.embedding_dimensions=768" : ""}
-      AND d.status='success' AND d.embedding_model=$3 AND d.embedding_dimensions=$4
+      AND d.status='success' AND d.deleted_at IS NULL AND d.embedding_model=$3 AND d.embedding_dimensions=$4
       ORDER BY ${expression} <=> $1::vector LIMIT $5`, [JSON.stringify(vector), b.id, b.embeddingModel, b.embeddingDimensions, limit]);
   }
 }

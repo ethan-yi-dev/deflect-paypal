@@ -76,8 +76,9 @@ needed. Model 2 uses Google's retrieval prompt formats; model 001 uses
 
 ## Tables
 
-Schema: [`001_knowledge_base.sql`](../db/migrations/001_knowledge_base.sql) and
-[`002_document_hash_updates.sql`](../db/migrations/002_document_hash_updates.sql).
+Schema: [`001_knowledge_base.sql`](../db/migrations/001_knowledge_base.sql),
+[`002_document_hash_updates.sql`](../db/migrations/002_document_hash_updates.sql), and
+[`003_document_soft_delete.sql`](../db/migrations/003_document_soft_delete.sql).
 `npm run db:migrate` applies all numbered migrations in order. They are repeatable;
 the hash migration backfills existing PDFs without deleting their contents. Existing
 duplicate names within one base must be resolved before adding the unique name index.
@@ -85,7 +86,7 @@ duplicate names within one base must be resolved before adding the unique name i
 | Table | Stores |
 | --- | --- |
 | `t_knowledge_base` | Knowledge-base identity and immutable embedding model/dimension binding. |
-| `t_knowledge_document` | Original PDF in `pdf_data bytea` or UTF-8 text in `text_content`; content type, SHA-256 `content_hash`, `source_version`, status, binding, timestamps, and chunk count. |
+| `t_knowledge_document` | Original PDF in `pdf_data bytea` or UTF-8 text in `text_content`; content type, SHA-256 `content_hash`, `source_version`, processing status, binding, timestamps, chunk count, and nullable `deleted_at` for soft deletion. |
 | `t_knowledge_chunk` | Chunk text, page, sequence, pgvector embedding, model binding; `doc_id` references the document. |
 | `t_knowledge_job` | Durable queued/working/done/failed attempts, source hash snapshot, and worker leases. |
 
@@ -118,7 +119,7 @@ WHERE id = :doc_id AND status <> 'running'
 RETURNING id;
 ```
 
-The actual statement also scopes the base and checks the model binding. Exactly
+The actual statement also scopes the base, requires `deleted_at IS NULL`, and checks the model binding. Exactly
 one concurrent request wins. A request that finds the document already running
 returns 409. The status update, removal of old vectors, and job insert commit in
 the same transaction; a queue write failure rolls everything back. Uploads and
@@ -143,7 +144,7 @@ chunks are prepared in memory, then inserted together with the `success` state
 in one transaction. Failed processing leaves no previous or partial vectors.
 The active run ID, source hash snapshot, and live worker lease fence the final
 write, so stale workers cannot overwrite a newer source or retried job. Pending,
-failed, and running documents are excluded from retrieval.
+failed, running, and soft-deleted documents are excluded from retrieval.
 
 ## Updating documents and checking SHA-256
 
@@ -167,7 +168,7 @@ It does not normalize whitespace or trust a client-supplied hash of the new cont
 - **Stale hash or running document:** return 409. A page opened before another
   update cannot overwrite the new version. Identical retries remain no-ops.
 
-Names are unique within each knowledge base. Uploading the same name and bytes
+Names are unique among active documents within each knowledge base. Uploading the same name and bytes
 again returns the existing document with `changed: false`. Different bytes with
 the same name return 409 and direct the user to **Update**, ensuring the intended
 document ID is explicit. Manual **Reindex** forces a full rebuild of the current
@@ -179,15 +180,38 @@ these diagnostic stack frames are not sent to the browser.
 No API key or raw provider response is returned to the browser. Retries are manual;
 there is no automatic provider retry loop beyond parse-result polling.
 
+## Removing documents from the knowledge base
+
+Click **Delete** on a document row to soft-delete it. The server sets `deleted_at`
+without deleting source bytes, chunk rows, vector values, or job history. The
+processing `status` remains separate from this removal flag. List and retrieval
+queries require `deleted_at IS NULL`; all chunks of a removed document are
+excluded through their `doc_id` relationship. The UI also clears its displayed
+search hits for that document and filters late polling/search responses.
+
+The delete endpoint is idempotent: repeated requests preserve the first removal
+timestamp. Removed IDs return 404 for source downloads, updates, and indexing.
+The name becomes available for a new upload, which gets a new ID, starts as
+`pending`, and does not reuse the retained vectors. There is no restore action
+in the current UI.
+
+Documents can be removed while indexing. A queued job is consumed and marked
+failed without calling providers. An active worker cannot load or commit a
+removed document, and its next lease renewal fails. Provider requests already
+in flight may finish, but their results cannot be stored or reactivate the
+document. Removing a document after indexing finishes preserves its successful
+status and vectors while excluding them from search.
+
 ## API
 
 All responses use `private, no-store`. The routes run in the Node.js runtime.
 
 | Endpoint | Behavior |
 | --- | --- |
-| `GET /api/knowledge-base/documents` | Returns binding, document IDs, status, SHA-256, source version/type, and timestamps; no source bytes. |
+| `GET /api/knowledge-base/documents` | Returns binding and active documents' IDs, status, SHA-256, source version/type, and timestamps; no source bytes. |
 | `POST /api/knowledge-base/documents` | Multipart `file` (PDF/TXT/MD) or JSON `{name,text}`; 201 for new `pending`, 200 for unchanged. |
 | `PUT /api/knowledge-base/documents/{id}` | Same file/text payload plus `If-Match: "<current contentHash>"`; 200 updated/unchanged, 409 conflict, 428 missing precondition. |
+| `DELETE /api/knowledge-base/documents/{id}` | Soft-deletes within the configured base; 200 with `id`, `deletedAt`, and a message, including repeated deletes. Unknown/other-base IDs return 404. No provider calls. |
 | `POST /api/knowledge-base/documents/{id}/index` | CAS + durable enqueue; returns 202, or 409 if running. |
 | `GET /api/knowledge-base/documents/{id}/source` | Downloads original bytes with the stored MIME type. The earlier `/pdf` route remains an alias. |
 | `POST /api/knowledge-base/query` | JSON `query`, optional `embeddingModel`, optional `limit` (1–20); returns chunks with cosine similarity and source pages. |
@@ -219,7 +243,9 @@ Knowledge tests execute the real migration and SQL against embedded PostgreSQL
 with pgvector (PGlite). They cover storage, concurrent CAS requests, transactional
 rollback, successful processing, failure/retry, atomic reindexing, lease expiry,
 stale-worker fencing, hash comparisons, duplicate uploads, concurrent updates,
-full vector replacement, text inputs, immutable models, dimensions, query scoping, page citations,
+full vector replacement, text inputs, soft-delete retention and retrieval exclusion,
+idempotent deletion, same-name reuploads, removal during indexing, repeatable migrations,
+immutable models, dimensions, query scoping, page citations,
 and mocked official provider request/response contracts. They require no database
 service, external credentials, paid API calls, or access to `.env.local`.
 
