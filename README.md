@@ -24,7 +24,7 @@ Built with Next.js, React, and TypeScript for the
 | Deflect assessment | Checks draft completeness and returns a rule-based suggestion about missing evidence or review steps. |
 | PayPal submission | Opens a review preview when the case offers evidence submission; sends no evidence or action requests. |
 | Demo studio | Offers three fixed scenarios with predefined recommendations, Policy/JEV results, and a simulated audit trail. |
-| Knowledge base | Stores PDF/text sources in PostgreSQL, skips identical SHA-256 uploads, updates documents by ID, runs asynchronous full vector replacement, and searches with pgvector. Includes retries and model binding. See [setup](documents/knowledge-base.md). |
+| RAG knowledge base | Stores and versions PDF/text sources, indexes them asynchronously, and retrieves evidence with pgvector and Cohere reranking. Includes SHA-256 change detection, soft deletion, and worker recovery. See [RAG pipeline](#rag-pipeline-and-knowledge-base). |
 
 The support details use neutral cards. **Evidence & next steps** is a separate
 **ACTION WORKSPACE**, with a dark green header, highlighted border, and its own
@@ -140,30 +140,202 @@ list.
 
 Notes and files stay in memory with each case while switching cases inside the
 live workspace. Reloading the page or switching to the demo studio clears those
-evidence drafts. Knowledge-base PDFs are stored separately in PostgreSQL and persist across reloads.
+evidence drafts. Knowledge-base documents are stored separately in PostgreSQL and persist across reloads.
 
 ### 4. Customize your knowledge base
 
-Open **Customize Your own knowledge base**, choose PDF/TXT/MD files up to 50 MB
-or select **Paste text**. Each new document is stored as `pending`. Click **Start chunking**
-to queue indexing; the status becomes `running`, then `success` or `failed`.
-**Retry chunking** retries a failed document, and **Reindex** replaces an existing
-document's chunks. **Update** replaces a document by ID: matching SHA-256 returns
-**No changes**; changed content removes old vectors and returns to `pending` for
-manual rebuilding. **Delete** soft-deletes a document: its original content,
-chunks, vectors, and job history stay in PostgreSQL, while the document disappears
-from the list and all retrieval results. The same name can be uploaded again as a
-new document. Only successful, active documents participate in **Search your knowledge**.
-Search retrieves up to 50 vector candidates by default, reranks them with Cohere,
-and returns the final top 5 with both similarity and rerank scores. Add
-`COHERE_API_KEY` to `.env.local` to enable reranking; missing keys or provider
-failures keep vector search available with an explicit warning. Existing
-embeddings do not need rebuilding.
+Open **Customize Your own knowledge base** to upload documents, paste text, manage
+existing sources, and search indexed content. The same knowledge base is available
+from the live workspace and demo studio. Follow the dedicated [RAG setup and
+pipeline guide below](#rag-pipeline-and-knowledge-base) before indexing.
 
-Run the PostgreSQL migration and the separate worker before indexing. The full
-[knowledge-base guide](documents/knowledge-base.md) explains configuration, tables,
-CAS behavior, API endpoints, worker recovery, and tests. Existing `.env.local`
-files need the new fields from `.env.example` added without overwriting PayPal credentials.
+## RAG pipeline and knowledge base
+
+Deflect implements the document ingestion, indexing, retrieval, and reranking
+stages of RAG. The current search returns evidence chunks with document names,
+page citations, and relevance scores. Generating an LLM answer from that evidence
+and using it in dispute assessments are planned integrations.
+The current application uses one configured knowledge base and has no per-user
+knowledge-base access controls.
+
+### Architecture
+
+```mermaid
+flowchart TD
+    upload["Upload PDF / TXT / Markdown / text"] --> pending["Store original and SHA-256: pending"]
+    pending -->|"Start chunking: atomic CAS"| worker["PostgreSQL queue and indexing worker"]
+    worker --> parse["PDF: LlamaParse; text: direct input"]
+    parse --> chunk["LlamaIndex chunking: 512 tokens, overlap 64"]
+    chunk --> embed["Google document embedding"]
+    embed --> store[("PostgreSQL + pgvector: success")]
+    query["User query"] --> queryEmbed["Google query embedding: same bound model"]
+    queryEmbed --> candidates["Vector retrieval: up to 50 candidates by default"]
+    store --> candidates
+    candidates --> rerank["Cohere reranking"]
+    rerank --> eligible["Recheck document and chunk eligibility"]
+    eligible --> results["Return final top K with citations: default 5"]
+```
+
+PDFs are parsed into Markdown pages by LlamaParse. LlamaIndex's local
+`SentenceSplitter` creates chunks while preserving page references. TXT, Markdown,
+and pasted text skip PDF parsing and use page number 1. Google AI Studio provides
+the embeddings; the default binding is `gemini-embedding-2` with 768 dimensions.
+
+All knowledge-base data lives in PostgreSQL; pgvector is an extension of that same
+database. The bundled [compose.yaml](compose.yaml) runs PostgreSQL 17 with pgvector.
+
+| Table | Responsibility |
+| --- | --- |
+| `t_knowledge_base` | Knowledge-base ID and immutable embedding model/dimension binding. |
+| `t_knowledge_document` | PDF bytes in `pdf_data` or UTF-8 `text_content`, SHA-256, source version, processing status, timestamps, and soft-delete flag. |
+| `t_knowledge_chunk` | Chunk text, page, sequence, model binding, and vector; linked to its document by `doc_id`. |
+| `t_knowledge_job` | Durable indexing attempts, source hash snapshots, leases, and execution/error records. |
+
+### Configuration and startup
+
+Use the Node.js and dependency setup in [Run locally](#run-locally). The knowledge
+base additionally needs PostgreSQL with **pgvector 0.8.0 or newer**, a Google AI
+Studio key, and a LlamaParse key. A Cohere key enables reranking.
+
+Merge these fields from [.env.example](.env.example) into `.env.local`, preserving
+existing PayPal credentials. Replace API key placeholders with real keys.
+
+```dotenv
+DATABASE_URL=postgresql://deflect:anyword@localhost:5432/deflect
+KNOWLEDGE_BASE_ID=default
+
+GEMINI_API_KEY=anyword
+GEMINI_EMBEDDING_MODEL=gemini-embedding-2
+GEMINI_EMBEDDING_DIMENSIONS=768
+
+LLAMA_CLOUD_API_KEY=anyword
+LLAMA_PARSE_TIER=agentic
+
+COHERE_API_KEY=anyword
+COHERE_RERANK_MODEL=rerank-v4.0-fast
+KNOWLEDGE_RERANK_CANDIDATES=50
+KNOWLEDGE_RERANK_TIMEOUT_MS=10000
+```
+
+The database URL matches the bundled local Docker configuration. Start it:
+
+```bash
+docker compose up -d postgres
+```
+
+Once PostgreSQL is healthy, apply the numbered migrations:
+
+```bash
+npm run db:migrate
+```
+
+Start the application in one terminal:
+
+```bash
+npm run dev
+```
+
+Start the indexing worker in another terminal:
+
+```bash
+npm run worker:knowledge
+```
+
+If the app is already running, start only the worker. Restart the app and worker
+after changing their environment configuration. Production runs the built Next.js
+app and worker as separate supervised processes.
+
+The first use binds the embedding model and dimensions to the knowledge base.
+Indexing and query both verify that binding, and a database trigger prevents
+changing it. To switch embedding models or dimensions, create a new
+`KNOWLEDGE_BASE_ID` and index the sources there. Changing the reranker does not
+require rebuilding embeddings.
+
+### Indexing and document lifecycle
+
+Upload nonempty PDF, UTF-8 TXT, or Markdown files up to **50 MiB each**, or use
+**Paste text**. Saving a source stores it as `pending`; indexing starts only when
+the user clicks **Start chunking**.
+
+```text
+Upload -> pending
+Start chunking -> running (queued, then consumed by a worker)
+Parse -> Chunk -> Embed -> Store -> success
+Processing error or expired worker lease -> failed -> manual retry
+```
+
+| Action | Behavior |
+| --- | --- |
+| **Start chunking** | Atomically sets `running` only if the document is not already running, then inserts a durable job in the same transaction. |
+| **Update**, unchanged SHA-256 | Returns **No changes**; preserves the source, version, timestamps, chunks, and vectors. No indexing job is created. |
+| **Update**, changed SHA-256 | Checks the current hash with `If-Match`, keeps the document ID, increments the version, deletes old vectors, and returns to `pending` in one transaction. Click **Start chunking** to rebuild. |
+| **Reindex** | Forces a full rebuild of the stored source, including removal of old vectors, even when its hash is unchanged. |
+| **Retry chunking** | Manually starts another attempt after a failed job. |
+| **Delete** | Sets `deleted_at`; retains the original, chunks, vectors, and job history while excluding them from the list and search. Repeated deletion is idempotent. |
+
+Active names are unique within each base. Uploading the same name and bytes is a
+no-op; different bytes under an existing name require **Update** by document ID.
+After soft deletion, the same name can be uploaded as a new document with a new ID.
+There is no restore action in the current UI.
+
+Each job has a two-minute lease renewed every 30 seconds. The active run ID,
+source hash, and live lease prevent stale workers from publishing results. New
+chunks and `success` commit together; a processing failure leaves no old or
+partially written index. Deleted documents cannot be reactivated by an in-flight
+worker. Changed updates are rejected while indexing is running.
+
+While the knowledge-base view is open, the UI polls after each response: every
+2 seconds when a document is running, otherwise every 10 seconds. Navigation away
+stops polling. Browser tab visibility does not currently pause it.
+
+### Retrieval, reranking, and fallback
+
+**Search your knowledge** embeds the query with the bound Google model and
+retrieves up to 50 vector candidates by default. Only `success` documents with
+`deleted_at IS NULL` and matching base/model/dimensions are eligible. The default
+768-dimensional vectors use an HNSW cosine index, with transaction-local iterative
+scanning to help fill the candidate set after filtering.
+
+The configured default, Cohere `rerank-v4.0-fast`, scores the query against candidate titles and
+chunk text. The server maps the ranking back to the original chunks, rechecks
+their current database eligibility, and then selects the final top K. Documents
+deleted or replaced during reranking are filtered out before returning results.
+
+| Setting or result | Meaning |
+| --- | --- |
+| `KNOWLEDGE_RERANK_CANDIDATES` | Internal candidate count; default 50, configurable from 20 to 100. |
+| Query `limit` | Final result count; default 5, configurable from 1 to 20. |
+| `score` / **Similarity** | Original cosine similarity, retained even after reranking. |
+| `rerankScore` / **Rerank** | Cohere relevance score, present only after successful reranking. |
+| `retrieval` | Response metadata with rerank status, model used, candidate count, and any fallback warning. |
+
+Missing/placeholder Cohere keys skip reranking. A provider error, invalid ranking,
+or timeout (default 10 seconds) falls back to vector ordering with an explicit
+warning. Empty candidate sets skip Cohere. Neither score represents answer
+confidence, and no minimum relevance threshold or keyword hybrid search is
+currently applied.
+
+### API and validation
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/knowledge-base/documents` | List active documents and the model binding. |
+| `POST /api/knowledge-base/documents` | Upload a multipart file or JSON `{name,text}`. |
+| `PUT /api/knowledge-base/documents/{id}` | Update a source using its current `If-Match` hash. |
+| `DELETE /api/knowledge-base/documents/{id}` | Soft-delete a document. |
+| `POST /api/knowledge-base/documents/{id}/index` | Trigger asynchronous indexing. |
+| `GET /api/knowledge-base/documents/{id}/source` | Download the stored original. |
+| `POST /api/knowledge-base/query` | Retrieve and rerank evidence chunks. |
+
+`npm run test:knowledge` runs PostgreSQL/pgvector tests with PGlite and mocked
+provider contracts. Coverage includes concurrency, rollback, worker recovery,
+hash updates, soft deletion, reranking, fallback, and eligibility checks after
+concurrent document changes. These tests require no external database, API keys,
+or paid provider calls; retrieval quality still needs evaluation on real business
+questions.
+
+The [knowledge-base engineering guide](documents/knowledge-base.md) contains full
+configuration details, transaction guarantees, API behavior, and provider references.
 
 ## Evidence rules
 
@@ -253,8 +425,9 @@ performs dispute mutations.
 
 The API detail response retains operational fields for future backend work;
 the frontend chooses the customer support fields to display. Knowledge-base upload,
-indexing, and search POST endpoints are implemented separately. PayPal evidence
-submission, execution, and appeal endpoints remain planned integrations.
+update, soft deletion, indexing, and reranked search endpoints are implemented
+separately. PayPal evidence submission, execution, and appeal endpoints remain
+planned integrations.
 
 | File | Responsibility |
 | --- | --- |
@@ -265,7 +438,13 @@ submission, execution, and appeal endpoints remain planned integrations.
 | [lib/paypal-disputes.ts](lib/paypal-disputes.ts) | Server-only facade and sanitized API error responses. |
 | [lib/paypal-disputes-client.ts](lib/paypal-disputes-client.ts) | OAuth and read-only Disputes REST requests. |
 | [app/dispute-workspace.tsx](app/dispute-workspace.tsx) | Mode switching and the static demo studio. |
+| [app/knowledge-base.tsx](app/knowledge-base.tsx) | Document management, indexing controls, status polling, and search results. |
+| [lib/knowledge/](lib/knowledge/) | Configuration, PostgreSQL repository, document validation, providers, worker processing, retrieval, and reranking. |
+| [scripts/knowledge-worker.ts](scripts/knowledge-worker.ts) | Standalone durable indexing worker. |
+| [db/migrations/](db/migrations/) | Repeatable PostgreSQL and pgvector schema migrations. |
 | [tests/paypal-disputes.test.ts](tests/paypal-disputes.test.ts) | Mocked API client, normalization, evidence, and file checks. |
+| [tests/knowledge-base.test.ts](tests/knowledge-base.test.ts) | PostgreSQL/pgvector storage, document lifecycle, CAS, worker recovery, and retrieval eligibility tests. |
+| [tests/knowledge-rerank.test.ts](tests/knowledge-rerank.test.ts) | Rerank API contract, result mapping, fallback, timeout, and cancellation checks. |
 
 The original SDK pages remain available:
 
@@ -288,16 +467,19 @@ expose a Disputes controller.
 | `npm run dev` | Start the UI and API routes in development. |
 | `npm run lint` | Run ESLint. |
 | `npm run test:disputes` | Compile and run the mocked Disputes and evidence checks with Node's test runner. |
-| `npm run test:knowledge` | Test PostgreSQL/pgvector storage, CAS, worker recovery, and mocked provider contracts with PGlite. |
+| `npm run test:knowledge` | Test PostgreSQL/pgvector storage, document lifecycle, worker recovery, and retrieval/reranking with mocked providers. |
 | `npm run db:migrate` | Initialize the PostgreSQL knowledge-base schema and pgvector extension. |
 | `npm run worker:knowledge` | Run the durable indexing queue worker alongside the Next.js server. |
 | `npm run build` | Build the production application and check TypeScript. |
 | `npm run start` | Serve an existing production build. |
 
-The automated tests use mocked PayPal responses and do not need credentials or
+The dispute tests use mocked PayPal responses and do not need credentials or
 send live PayPal requests. They cover token sharing/refresh, query errors, ID
 validation, missing facts, seller evidence selection, baseline alternatives,
 unknown evidence, and file limits.
+
+Run the test and build commands sequentially: dispute test compilation and the
+Next.js build both write generated files under `.next`.
 
 ## Troubleshooting
 
@@ -311,6 +493,10 @@ unknown evidence, and file limits.
 | Preview confirmation is disabled | A specific seller request and complete draft fields are required. |
 | Files disappeared | Drafts are in-memory and reset on reload or when leaving the live workspace. |
 | Timeout or rate limit | Check server connectivity to PayPal; wait before retrying a rate-limited request. |
+| Knowledge database is unavailable | Start PostgreSQL, check `DATABASE_URL`, and apply `npm run db:migrate` with pgvector available. |
+| A knowledge document stays `running` | Start `npm run worker:knowledge` to consume queued jobs and recover expired leases. Failed attempts can be retried manually. |
+| Search shows a vector-only warning | Configure `COHERE_API_KEY` and restart the app, or check the reported Cohere credentials, quota, model, and timeout error. |
+| A knowledge document has no search hits | Confirm indexing reached `success`, the document is not soft-deleted, and the configured embedding binding matches. |
 
 ## Planned integrations
 
