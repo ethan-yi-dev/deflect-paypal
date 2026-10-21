@@ -1,6 +1,6 @@
 # Knowledge base
 
-The knowledge base is shared by the live and demo workspaces. PDFs, metadata,
+The knowledge base is shared by the live and demo workspaces. PDF/text sources, metadata,
 chunks, vectors, and jobs all persist in PostgreSQL. No object store, separate
 vector database, Redis service, or browser storage is required.
 
@@ -41,9 +41,10 @@ vector database, Redis service, or browser storage is required.
    separately under your process supervisor. Additional worker processes can
    consume different jobs through PostgreSQL `FOR UPDATE SKIP LOCKED`.
 
-Open **Customize Your own knowledge base**. Upload a PDF, then click **Start
-chunking**. The worker calls LlamaParse and Google; uploading alone stores the
-PDF and does not invoke paid providers. Click a document name to download its
+Open **Customize Your own knowledge base**. Upload PDF/TXT/MD files or select
+**Paste text**, then click **Start chunking**. The worker calls LlamaParse for PDFs
+and Google for embeddings; saving a source does not invoke paid providers.
+Click a document name to download its
 stored original. **Search your knowledge** returns matching chunks and page
 citations; it does not generate an LLM answer or change dispute recommendations.
 
@@ -75,17 +76,22 @@ needed. Model 2 uses Google's retrieval prompt formats; model 001 uses
 
 ## Tables
 
-Schema: [`db/migrations/001_knowledge_base.sql`](../db/migrations/001_knowledge_base.sql).
+Schema: [`001_knowledge_base.sql`](../db/migrations/001_knowledge_base.sql) and
+[`002_document_hash_updates.sql`](../db/migrations/002_document_hash_updates.sql).
+`npm run db:migrate` applies all numbered migrations in order. They are repeatable;
+the hash migration backfills existing PDFs without deleting their contents. Existing
+duplicate names within one base must be resolved before adding the unique name index.
 
 | Table | Stores |
 | --- | --- |
 | `t_knowledge_base` | Knowledge-base identity and immutable embedding model/dimension binding. |
-| `t_knowledge_document` | Original PDF in `pdf_data bytea`, filename, size, status, model binding, active run ID, error, timestamps, and chunk count. |
+| `t_knowledge_document` | Original PDF in `pdf_data bytea` or UTF-8 text in `text_content`; content type, SHA-256 `content_hash`, `source_version`, status, binding, timestamps, and chunk count. |
 | `t_knowledge_chunk` | Chunk text, page, sequence, pgvector embedding, model binding; `doc_id` references the document. |
-| `t_knowledge_job` | Durable queued/working/done/failed indexing attempts and worker leases. |
+| `t_knowledge_job` | Durable queued/working/done/failed attempts, source hash snapshot, and worker leases. |
 
-The PDF limit is 50 MiB per file. The API enforces both streamed request size and
-the PDF's size/signature; the database checks byte length and the size limit.
+The source limit is 50 MiB. Files may be PDF, UTF-8 TXT, or UTF-8 Markdown.
+The API enforces streamed request size, source size, PDF signatures, and text encoding;
+the database checks byte length, source shape, and the SHA-256 against the stored bytes.
 Multi-file uploads are sent one at a time, and successful files are removed
 from the selection even if another file fails. Failed selections remain available
 for retry. The supplied app uses one configured base; it has no user/tenant
@@ -98,7 +104,9 @@ Upload -> pending
 User starts indexing -> running (queued, then consumed by a worker)
 Parse -> Chunk -> Embed -> Store -> success
 Any processing error -> failed
-User retries/reindexes -> running
+Changed update -> pending (old vectors removed)
+Unchanged update -> no state change
+User retries/reindexes -> running (old vectors removed)
 ```
 
 The trigger endpoint uses an atomic conditional `UPDATE`:
@@ -112,8 +120,9 @@ RETURNING id;
 
 The actual statement also scopes the base and checks the model binding. Exactly
 one concurrent request wins. A request that finds the document already running
-returns 409. The update and job insert commit in the same transaction; a queue
-write failure rolls back the status change. Uploads do not automatically queue jobs.
+returns 409. The status update, removal of old vectors, and job insert commit in
+the same transaction; a queue write failure rolls everything back. Uploads and
+updates do not automatically queue jobs.
 
 The worker renews its two-minute lease every 30 seconds. A worker that loses its
 lease cannot commit results. Any active worker recovers expired jobs as `failed`,
@@ -126,13 +135,43 @@ until `COMPLETED`. Parsed Markdown pages are chunked with LlamaIndex's
 LlamaParse's parse API itself returns parsed content; it does not expose an
 independent chunk endpoint. No LlamaCloud hosted index/vector store is created.
 Each chunk then gets a Google embedding. Provider request timeouts are 60 seconds;
-the parse polling deadline is 15 minutes.
+the parse polling deadline is 15 minutes. Text/Markdown sources skip LlamaParse
+and go directly to the same chunking and embedding steps, with page number 1.
 
-All new chunks are prepared before a transaction replaces the previous chunks
-and marks the document `success`. A failed attempt does not expose partial
-vectors. The document's active run ID and the job's live lease fence the final
-write, so a stale worker cannot overwrite a retried job. Failed and running
-documents are excluded from retrieval even if they have earlier chunks.
+Full replacement deletes old chunks/vectors before new processing begins. New
+chunks are prepared in memory, then inserted together with the `success` state
+in one transaction. Failed processing leaves no previous or partial vectors.
+The active run ID, source hash snapshot, and live worker lease fence the final
+write, so stale workers cannot overwrite a newer source or retried job. Pending,
+failed, and running documents are excluded from retrieval.
+
+## Updating documents and checking SHA-256
+
+Use **Update** on a document row to target its existing `doc_id`. Choose one new
+PDF/TXT/MD file or switch to **Paste text**, then click **Save update**. The UI
+displays the source version and a SHA-256 preview; hovering the preview reveals
+the full hash and document ID.
+
+The server computes SHA-256 from the original PDF bytes or exact UTF-8 text bytes.
+It does not normalize whitespace or trust a client-supplied hash of the new content.
+
+- **Same hash:** return `changed: false`, `operation: "unchanged"`, and `No changes`.
+  The source, version, status, timestamps, chunks, and vectors are retained. No
+  parse job or embedding request is made. This no-op is also safe while indexing.
+- **Different hash:** lock the document row, verify it is not `running`, and compare
+  the `If-Match` hash against the current stored hash. Delete every old chunk/vector
+  for this `doc_id`, replace the source/name, increment `source_version`, clear old
+  index/error metadata, and set `pending` in the same transaction. Click **Start
+  chunking** to execute the full rebuild. A rejected source update rolls back the
+  entire transaction, including any vector deletion.
+- **Stale hash or running document:** return 409. A page opened before another
+  update cannot overwrite the new version. Identical retries remain no-ops.
+
+Names are unique within each knowledge base. Uploading the same name and bytes
+again returns the existing document with `changed: false`. Different bytes with
+the same name return 409 and direct the user to **Update**, ensuring the intended
+document ID is explicit. Manual **Reindex** forces a full rebuild of the current
+stored content, even when its hash is unchanged.
 
 Errors are retained on documents and jobs with sanitized provider/status messages.
 Jobs also record `failed_step` and sanitized stack call frames in `error_stack`;
@@ -146,10 +185,11 @@ All responses use `private, no-store`. The routes run in the Node.js runtime.
 
 | Endpoint | Behavior |
 | --- | --- |
-| `GET /api/knowledge-base/documents` | Returns the model binding and document metadata, never the PDF bytes. |
-| `POST /api/knowledge-base/documents` | Multipart `file`: one PDF; returns 201 with `pending`. |
+| `GET /api/knowledge-base/documents` | Returns binding, document IDs, status, SHA-256, source version/type, and timestamps; no source bytes. |
+| `POST /api/knowledge-base/documents` | Multipart `file` (PDF/TXT/MD) or JSON `{name,text}`; 201 for new `pending`, 200 for unchanged. |
+| `PUT /api/knowledge-base/documents/{id}` | Same file/text payload plus `If-Match: "<current contentHash>"`; 200 updated/unchanged, 409 conflict, 428 missing precondition. |
 | `POST /api/knowledge-base/documents/{id}/index` | CAS + durable enqueue; returns 202, or 409 if running. |
-| `GET /api/knowledge-base/documents/{id}/pdf` | Downloads the PDF stored in PostgreSQL. |
+| `GET /api/knowledge-base/documents/{id}/source` | Downloads original bytes with the stored MIME type. The earlier `/pdf` route remains an alias. |
 | `POST /api/knowledge-base/query` | JSON `query`, optional `embeddingModel`, optional `limit` (1–20); returns chunks with cosine similarity and source pages. |
 
 Example query body:
@@ -178,7 +218,8 @@ npm run build
 Knowledge tests execute the real migration and SQL against embedded PostgreSQL
 with pgvector (PGlite). They cover storage, concurrent CAS requests, transactional
 rollback, successful processing, failure/retry, atomic reindexing, lease expiry,
-stale-worker fencing, immutable models, dimensions, query scoping, page citations,
+stale-worker fencing, hash comparisons, duplicate uploads, concurrent updates,
+full vector replacement, text inputs, immutable models, dimensions, query scoping, page citations,
 and mocked official provider request/response contracts. They require no database
 service, external credentials, paid API calls, or access to `.env.local`.
 

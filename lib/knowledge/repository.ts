@@ -1,17 +1,20 @@
 import { randomUUID } from "node:crypto";
 import { assertBinding, KnowledgeError } from "./config";
 import type { Database, Sql } from "./database";
-import { MAX_PDF_BYTES, type KnowledgeChunk, type KnowledgeDocument, type KnowledgeStatus, type ModelBinding, type SearchHit } from "./types";
+import { prepareFile, type DocumentSource } from "./document-source";
+import type { KnowledgeChunk, KnowledgeContentType, KnowledgeDocument, KnowledgeStatus, KnowledgeWriteResult, ModelBinding, SearchHit } from "./types";
 
 type DocumentRow = {
   id: string; name: string; size: number; status: KnowledgeStatus; embedding_model: string;
   chunk_count: number; error_message: string | null; created_at: Date | string; indexed_at: Date | string | null;
+  content_type: KnowledgeContentType; content_hash: string; source_version: number; updated_at: Date | string;
 };
-const documentColumns = "id, name, size, status, embedding_model, chunk_count, error_message, created_at, indexed_at";
+const documentColumns = "id, name, size, status, embedding_model, chunk_count, error_message, created_at, indexed_at, content_type, content_hash, source_version, updated_at";
 function documentDto(row: DocumentRow): KnowledgeDocument {
   return {
     id: row.id, name: row.name, size: row.size, status: row.status, embeddingModel: row.embedding_model,
     chunkCount: row.chunk_count, errorMessage: row.error_message,
+    contentType: row.content_type, contentHash: row.content_hash, sourceVersion: row.source_version, updatedAt: new Date(row.updated_at).toISOString(),
     uploadedAt: new Date(row.created_at).toISOString(), indexedAt: row.indexed_at ? new Date(row.indexed_at).toISOString() : null,
   };
 }
@@ -41,16 +44,41 @@ export class KnowledgeRepository {
   }
 
   async upload(name: string, pdf: Uint8Array) {
-    if (!name.toLowerCase().endsWith(".pdf") || !name.trim() || name.length > 255 || pdf.length > MAX_PDF_BYTES
-        || pdf.length < 5 || Buffer.from(pdf.subarray(0, 5)).toString("ascii") !== "%PDF-") {
-      throw new KnowledgeError("INVALID_PDF", "Upload a valid PDF up to 50 MB with a filename of at most 255 characters.", 400);
-    }
-    const b = await this.ensureBase();
-    const [row] = await this.db.query<DocumentRow>(`INSERT INTO t_knowledge_document
-      (id, knowledge_base_id, name, size, pdf_data, embedding_model, embedding_dimensions)
-      VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING ${documentColumns}`,
-    [randomUUID(), b.id, name, pdf.length, Buffer.from(pdf), b.embeddingModel, b.embeddingDimensions]);
-    return documentDto(row);
+    return (await this.createDocument(prepareFile(name, pdf))).document;
+  }
+
+  async createDocument(source: DocumentSource): Promise<KnowledgeWriteResult> {
+    return this.db.transaction(async (sql) => {
+      const b = await this.ensureBase(sql);
+      const [row] = await sql<DocumentRow>(`INSERT INTO t_knowledge_document
+        (id, knowledge_base_id, name, size, pdf_data, text_content, content_type, content_hash, embedding_model, embedding_dimensions)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (knowledge_base_id, name) DO NOTHING RETURNING ${documentColumns}`,
+      [randomUUID(), b.id, source.name, source.size, source.pdf, source.text, source.contentType, source.hash, b.embeddingModel, b.embeddingDimensions]);
+      if (row) return { document: documentDto(row), changed: true, operation: "created", message: "Document uploaded as pending." };
+      const [existing] = await sql<DocumentRow>(`SELECT ${documentColumns} FROM t_knowledge_document WHERE knowledge_base_id=$1 AND name=$2 FOR UPDATE`, [b.id, source.name]);
+      if (existing.content_hash === source.hash) return { document: documentDto(existing), changed: false, operation: "unchanged", message: "No changes. Existing content and vectors were kept." };
+      throw new KnowledgeError("DOCUMENT_EXISTS", "A document with this name already exists. Use its Update action to replace it by document ID.", 409);
+    });
+  }
+
+  async updateDocument(docId: string, source: DocumentSource, expectedHash: string): Promise<KnowledgeWriteResult> {
+    return this.db.transaction(async (sql) => {
+      const b = await this.ensureBase(sql);
+      const [existing] = await sql<DocumentRow>(`SELECT ${documentColumns} FROM t_knowledge_document WHERE id=$1 AND knowledge_base_id=$2 FOR UPDATE`, [docId, b.id]);
+      if (!existing) throw new KnowledgeError("DOCUMENT_NOT_FOUND", "Document not found.", 404);
+      // An identical upload is a no-op even while indexing; it must not alter the job.
+      if (existing.content_hash === source.hash) return { document: documentDto(existing), changed: false, operation: "unchanged", message: "No changes. Existing content and vectors were kept." };
+      if (existing.status === "running") throw new KnowledgeError("ALREADY_RUNNING", "This document is running. Wait for indexing to finish before updating it.", 409);
+      if (existing.content_hash !== expectedHash) throw new KnowledgeError("DOCUMENT_CHANGED", "This document changed since you opened it. Refresh and review the latest version before updating.", 409);
+      // Preserve document identity; full replacement removes old vectors first.
+      await sql("DELETE FROM t_knowledge_chunk WHERE doc_id=$1", [docId]);
+      const [row] = await sql<DocumentRow>(`UPDATE t_knowledge_document SET size=$3, pdf_data=$4, text_content=$5,
+        content_type=$6, content_hash=$7, source_version=source_version+1, status='pending', active_run_id=NULL,
+        chunk_count=0, indexed_at=NULL, error_message=NULL, updated_at=now(), name=$8
+        WHERE id=$1 AND knowledge_base_id=$2 RETURNING ${documentColumns}`,
+      [docId, b.id, source.size, source.pdf, source.text, source.contentType, source.hash, source.name]);
+      return { document: documentDto(row), changed: true, operation: "updated", message: "Document updated. Old vectors were removed. Start chunking to rebuild the index." };
+    });
   }
 
   async startIndexing(docId: string) {
@@ -59,7 +87,7 @@ export class KnowledgeRepository {
       const runId = randomUUID();
       // Atomic CAS: concurrent requests recheck this predicate after row-lock waits.
       const [row] = await sql<DocumentRow>(`UPDATE t_knowledge_document SET status='running', active_run_id=$3,
-        error_message=NULL, updated_at=now() WHERE id=$1 AND knowledge_base_id=$2 AND status <> 'running'
+        error_message=NULL, chunk_count=0, indexed_at=NULL, updated_at=now() WHERE id=$1 AND knowledge_base_id=$2 AND status <> 'running'
         AND embedding_model=$4 AND embedding_dimensions=$5 RETURNING ${documentColumns}`,
       [docId, b.id, runId, b.embeddingModel, b.embeddingDimensions]);
       if (!row) {
@@ -67,7 +95,8 @@ export class KnowledgeRepository {
         throw new KnowledgeError(existing.length ? "ALREADY_RUNNING" : "DOCUMENT_NOT_FOUND", existing.length ? "This document is already running. Wait for it to finish." : "Document not found.", existing.length ? 409 : 404);
       }
       // Status and durable job are committed together; no fire-and-forget request task.
-      await sql("INSERT INTO t_knowledge_job (id, doc_id) VALUES ($1,$2)", [runId, docId]);
+      await sql("DELETE FROM t_knowledge_chunk WHERE doc_id=$1", [docId]);
+      await sql("INSERT INTO t_knowledge_job (id, doc_id, source_hash) VALUES ($1,$2,$3)", [runId, docId, row.content_hash]);
       return documentDto(row);
     });
   }
@@ -90,11 +119,11 @@ export class KnowledgeRepository {
 
   async loadJobDocument(job: ClaimedJob) {
     await this.ensureBase();
-    const [row] = await this.db.query<{ name: string; pdf_data: Uint8Array; embedding_model: string; embedding_dimensions: number }>(`SELECT name, pdf_data, embedding_model, embedding_dimensions FROM t_knowledge_document
-      WHERE id=$1 AND active_run_id=$2 AND status='running' AND knowledge_base_id=$3`, [job.docId, job.id, this.binding.id]);
+    const [row] = await this.db.query<{ name: string; pdf_data: Uint8Array | null; text_content: string | null; content_type: KnowledgeContentType; embedding_model: string; embedding_dimensions: number }>(`SELECT d.name, d.pdf_data, d.text_content, d.content_type, d.embedding_model, d.embedding_dimensions FROM t_knowledge_document d JOIN t_knowledge_job j ON j.id=d.active_run_id
+      WHERE d.id=$1 AND d.active_run_id=$2 AND d.status='running' AND d.knowledge_base_id=$3 AND j.source_hash=d.content_hash`, [job.docId, job.id, this.binding.id]);
     if (!row) throw new KnowledgeError("STALE_JOB", "This indexing attempt is no longer active.", 409);
     assertBinding({ id: this.binding.id, embeddingModel: row.embedding_model, embeddingDimensions: row.embedding_dimensions }, this.binding);
-    return { name: row.name, pdf: row.pdf_data };
+    return { name: row.name, pdf: row.pdf_data, text: row.text_content, contentType: row.content_type };
   }
 
   async completeJob(job: ClaimedJob, chunks: KnowledgeChunk[]) {
@@ -102,9 +131,9 @@ export class KnowledgeRepository {
     for (const chunk of chunks) validateVector(chunk.embedding, this.binding.embeddingDimensions);
     await this.db.transaction(async (sql) => {
       const b = await this.ensureBase(sql);
-      const lease = await sql("SELECT id FROM t_knowledge_job WHERE id=$1 AND state='working' AND lease_until > now() FOR UPDATE", [job.id]);
-      const active = await sql("SELECT id FROM t_knowledge_document WHERE id=$1 AND active_run_id=$2 AND status='running' AND knowledge_base_id=$3 FOR UPDATE", [job.docId, job.id, b.id]);
-      if (!lease.length || !active.length) throw new KnowledgeError("STALE_JOB", "A stale worker cannot overwrite this document.", 409);
+      const [lease] = await sql<{ source_hash: string }>("SELECT source_hash FROM t_knowledge_job WHERE id=$1 AND state='working' AND lease_until > now() FOR UPDATE", [job.id]);
+      const active = await sql("SELECT id FROM t_knowledge_document WHERE id=$1 AND active_run_id=$2 AND status='running' AND knowledge_base_id=$3 AND content_hash=$4 FOR UPDATE", [job.docId, job.id, b.id, lease?.source_hash ?? ""]);
+      if (!lease || !active.length) throw new KnowledgeError("STALE_JOB", "A stale worker cannot overwrite this document.", 409);
       await sql("DELETE FROM t_knowledge_chunk WHERE doc_id=$1", [job.docId]);
       for (const [index, chunk] of chunks.entries()) {
         await sql(`INSERT INTO t_knowledge_chunk (id, doc_id, knowledge_base_id, chunk_index, content, page_number, embedding_model, embedding_dimensions, embedding)
@@ -137,6 +166,13 @@ export class KnowledgeRepository {
 
   async pdf(docId: string) {
     const [row] = await this.db.query<{ name: string; pdf_data: Uint8Array }>("SELECT name, pdf_data FROM t_knowledge_document WHERE id=$1 AND knowledge_base_id=$2", [docId, this.binding.id]);
+    if (!row) throw new KnowledgeError("DOCUMENT_NOT_FOUND", "Document not found.", 404);
+    return row;
+  }
+
+  async source(docId: string) {
+    const [row] = await this.db.query<{ name: string; content_type: KnowledgeContentType; source_data: Uint8Array }>(`SELECT name, content_type, COALESCE(pdf_data, convert_to(text_content, 'UTF8')) AS source_data
+      FROM t_knowledge_document WHERE id=$1 AND knowledge_base_id=$2`, [docId, this.binding.id]);
     if (!row) throw new KnowledgeError("DOCUMENT_NOT_FOUND", "Document not found.", 404);
     return row;
   }

@@ -1,17 +1,24 @@
 export const MAX_PDF_BYTES = 50 * 1024 * 1024;
+export const KNOWLEDGE_FILE_ACCEPT = ".pdf,.txt,.md";
+export type KnowledgeContentType = "application/pdf" | "text/plain" | "text/markdown";
 export type KnowledgeStatus = "pending" | "running" | "success" | "failed";
 export type ModelBinding = { id: string; embeddingModel: string; embeddingDimensions: number };
 export type KnowledgeDocument = {
   id: string;
   name: string;
   size: number;
+  contentType: KnowledgeContentType;
+  contentHash: string;
+  sourceVersion: number;
   status: KnowledgeStatus;
   embeddingModel: string;
   chunkCount: number;
   errorMessage: string | null;
   uploadedAt: string;
+  updatedAt: string;
   indexedAt: string | null;
 };
+export type KnowledgeWriteResult = { document: KnowledgeDocument; changed: boolean; operation: "created" | "updated" | "unchanged"; message: string };
 export type KnowledgeList = { knowledgeBase: ModelBinding; documents: KnowledgeDocument[] };
 export type ParsedPage = { pageNumber: number; text: string };
 export type KnowledgeChunk = ParsedPage & { embedding: number[] };

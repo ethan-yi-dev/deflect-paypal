@@ -12,6 +12,7 @@ export function knowledgeErrorResponse(error: unknown) {
   if (error instanceof KnowledgeError) return Response.json({ error: { code: error.code, message: error.message } }, { status: error.status, headers: knowledgeHeaders });
   // Never return raw database/provider errors, connection strings, or credentials.
   const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+  if (code === "23505") return Response.json({ error: { code: "DOCUMENT_EXISTS", message: "A document with this name already exists. Refresh the document list and use its Update action." } }, { status: 409, headers: knowledgeHeaders });
   const message = code === "42P01" || code === "42704"
     ? "Knowledge database is not initialized. Run npm run db:migrate with pgvector available."
     : "Unable to access the knowledge database. Check DATABASE_URL and PostgreSQL availability.";

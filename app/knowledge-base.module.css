@@ -1,6 +1,19 @@
 .heading:focus { outline: none; }
 .sections { display: grid; gap: 24px; }
 .uploadBody { padding: 24px; }
+.inputModes { display: flex; gap: 6px; margin-bottom: 16px; }
+.inputModes button { display: inline-flex; align-items: center; gap: 7px; padding: 8px 12px; border: 1px solid #e2e9d8; border-radius: 6px; color: #7b8a6e; font-size: 12px; }
+.inputModes button[aria-pressed="true"] { background: #edf4e4; border-color: #c8d8b4; color: #3e6030; }
+.updateBanner { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 18px; padding: 15px; border: 1px solid #ccdcba; border-radius: 7px; background: #f3f8eb; }
+.updateBanner strong { font-size: 13px; font-weight: 550; overflow-wrap: anywhere; }
+.updateBanner p { margin-top: 5px; color: #80916f; font-size: 11px; }
+.updateBanner button { flex-shrink: 0; }
+.textEditor { display: grid; gap: 15px; }
+.textEditor label { display: grid; gap: 7px; color: #637b4d; font-size: 12px; }
+.textEditor input, .textEditor textarea { width: 100%; padding: 10px 12px; border: 1px solid #dce5d1; border-radius: 6px; background: #fafcf7; color: #344d2f; font: inherit; }
+.textEditor textarea { resize: vertical; min-height: 180px; line-height: 1.7; }
+.documentHash { display: block; margin-top: 5px; font-size: 10px; color: #8b9b7a; }
+.rowActions { display: flex; align-items: center; gap: 7px; }
 .dropzone { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 260px; padding: 30px 22px; border: 1.5px dashed #cad7bc; border-radius: 9px; background: #f8faf4; text-align: center; }
 .dragging { background: #edf5df; border-color: #577e3e; }
 .uploadIcon { display: grid; place-items: center; width: 56px; height: 56px; margin-bottom: 17px; border: 1px solid #dce6d0; border-radius: 14px; background: #edf3e4; color: #63844c; }
@@ -58,6 +71,7 @@
 .srOnly { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
 @media (max-width: 650px) {
+  .updateBanner { align-items: stretch; flex-direction: column; }
   .searchBody { padding: 17px; }
   .searchForm { flex-direction: column; }
   .modelNote { padding-left: 17px; padding-right: 17px; }

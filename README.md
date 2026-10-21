@@ -24,7 +24,7 @@ Built with Next.js, React, and TypeScript for the
 | Deflect assessment | Checks draft completeness and returns a rule-based suggestion about missing evidence or review steps. |
 | PayPal submission | Opens a review preview when the case offers evidence submission; sends no evidence or action requests. |
 | Demo studio | Offers three fixed scenarios with predefined recommendations, Policy/JEV results, and a simulated audit trail. |
-| Knowledge base | Stores PDFs in PostgreSQL, runs manual asynchronous indexing through LlamaParse + LlamaIndex + Google embeddings, and searches chunks with pgvector. Includes status polling, retries, and model binding. See [setup](documents/knowledge-base.md). |
+| Knowledge base | Stores PDF/text sources in PostgreSQL, skips identical SHA-256 uploads, updates documents by ID, runs asynchronous full vector replacement, and searches with pgvector. Includes retries and model binding. See [setup](documents/knowledge-base.md). |
 
 The support details use neutral cards. **Evidence & next steps** is a separate
 **ACTION WORKSPACE**, with a dark green header, highlighted border, and its own
@@ -144,11 +144,13 @@ evidence drafts. Knowledge-base PDFs are stored separately in PostgreSQL and per
 
 ### 4. Customize your knowledge base
 
-Open **Customize Your own knowledge base**, choose PDFs up to 50 MB each, and
-click **Upload documents**. Each PDF is stored as `pending`. Click **Start chunking**
+Open **Customize Your own knowledge base**, choose PDF/TXT/MD files up to 50 MB
+or select **Paste text**. Each new document is stored as `pending`. Click **Start chunking**
 to queue indexing; the status becomes `running`, then `success` or `failed`.
 **Retry chunking** retries a failed document, and **Reindex** replaces an existing
-document's chunks. Only successful documents participate in **Search your knowledge**.
+document's chunks. **Update** replaces a document by ID: matching SHA-256 returns
+**No changes**; changed content removes old vectors and returns to `pending` for
+manual rebuilding. Only successful documents participate in **Search your knowledge**.
 
 Run the PostgreSQL migration and the separate worker before indexing. The full
 [knowledge-base guide](documents/knowledge-base.md) explains configuration, tables,

@@ -1,15 +1,16 @@
 import { loadEnvConfig } from "@next/env";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { getPool, postgresDatabase } from "../lib/knowledge/database";
 
 async function main() {
   loadEnvConfig(process.cwd());
   const pool = getPool();
   try {
-    const sql = await readFile("db/migrations/001_knowledge_base.sql", "utf8");
+    const files = (await readdir("db/migrations")).filter((name) => /^\d+.*\.sql$/.test(name)).sort();
+    const migrations = await Promise.all(files.map((name) => readFile(`db/migrations/${name}`, "utf8")));
     await postgresDatabase(pool).transaction(async (query) => {
       await query("SELECT pg_advisory_xact_lock(746483921)");
-      await query(sql);
+      for (const sql of migrations) await query(sql);
     });
     console.info("Knowledge schema is ready (PostgreSQL + pgvector).");
   } finally { await pool.end(); }

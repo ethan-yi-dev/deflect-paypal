@@ -16,7 +16,9 @@ export async function processNextKnowledgeJob(repository: KnowledgeRepository, p
   try {
     const document = await repository.loadJobDocument(job);
     step = "parse";
-    const pages = await providers.parse(document.pdf, document.name, signal);
+    const pages = document.contentType === "application/pdf" && document.pdf
+      ? await providers.parse(document.pdf, document.name, signal)
+      : [{ pageNumber: 1, text: document.text ?? "" }];
     step = "chunk";
     const parts = chunkPages(pages);
     const chunks: KnowledgeChunk[] = [];

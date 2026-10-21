@@ -1,12 +1,10 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, type DragEvent, type FormEvent } from "react";
-import { MAX_PDF_BYTES, type KnowledgeDocument, type KnowledgeList, type ModelBinding, type SearchHit } from "@/lib/knowledge/types";
+import { KNOWLEDGE_FILE_ACCEPT, MAX_PDF_BYTES, type KnowledgeDocument, type KnowledgeList, type KnowledgeWriteResult, type ModelBinding, type SearchHit } from "@/lib/knowledge/types";
 import { Badge, Icon } from "./workspace-ui";
 import workspace from "./dispute-workspace.module.css";
 import styles from "./knowledge-base.module.css";
-
-const fileAccept = ".pdf";
 
 async function readApi<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, { ...init, cache: "no-store" });
@@ -47,6 +45,10 @@ export default function KnowledgeBase({ hidden, onBack }: {
   const [actionError, setActionError] = useState("");
   const [notice, setNotice] = useState("");
   const [uploading, setUploading] = useState(false);
+  const [updateTarget, setUpdateTarget] = useState<KnowledgeDocument | null>(null);
+  const [inputMode, setInputMode] = useState<"file" | "text">("file");
+  const [textName, setTextName] = useState("");
+  const [textContent, setTextContent] = useState("");
   const [startingId, setStartingId] = useState("");
   const [query, setQuery] = useState("");
   const [searching, setSearching] = useState(false);
@@ -57,6 +59,7 @@ export default function KnowledgeBase({ hidden, onBack }: {
   const [dragging, setDragging] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const heading = useRef<HTMLHeadingElement>(null);
+  const uploadSection = useRef<HTMLElement>(null);
   const dragDepth = useRef(0);
 
   const reload = useCallback(async (signal?: AbortSignal) => {
@@ -95,21 +98,56 @@ export default function KnowledgeBase({ hidden, onBack }: {
     setActionError("");
     setNotice("");
     const failures: string[] = [];
-    let count = 0;
+    const results: KnowledgeWriteResult[] = [];
     try {
-      for (const file of files) {
+      const endpoint = updateTarget ? `/api/knowledge-base/documents/${updateTarget.id}` : "/api/knowledge-base/documents";
+      const headers: Record<string, string> = updateTarget ? { "If-Match": `"${updateTarget.contentHash}"` } : {};
+      const method = updateTarget ? "PUT" : "POST";
+      if (inputMode === "text") {
         try {
-          const body = new FormData();
-          body.set("file", file);
-          await readApi("/api/knowledge-base/documents", { method: "POST", body });
-          count += 1;
-          setFiles((previous) => previous.filter((item) => fileKey(item) !== fileKey(file)));
-        } catch (error) { failures.push(`${file.name}: ${error instanceof Error ? error.message : "Upload failed."}`); }
+          results.push(await readApi<KnowledgeWriteResult>(endpoint, {
+            method, headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ name: textName, text: textContent }),
+          }));
+          setTextContent("");
+        } catch (error) { failures.push(error instanceof Error ? error.message : "Could not save text."); }
+      } else {
+        for (const file of files) {
+          try {
+            const body = new FormData();
+            body.set("file", file);
+            results.push(await readApi<KnowledgeWriteResult>(endpoint, { method, headers, body }));
+            setFiles((previous) => previous.filter((item) => fileKey(item) !== fileKey(file)));
+          } catch (error) { failures.push(`${file.name}: ${error instanceof Error ? error.message : "Upload failed."}`); }
+        }
       }
       setActionError(failures.join(" "));
-      if (count) setNotice(`${count} PDF${count === 1 ? "" : "s"} uploaded as pending. Start chunking when you are ready.`);
+      if (results.length === 1) setNotice(results[0].message);
+      else if (results.length) setNotice(`${results.filter((item) => item.changed).length} documents saved as pending. ${results.filter((item) => !item.changed).length} unchanged. Start chunking for changed documents.`);
+      if (results.length && updateTarget) setUpdateTarget(null);
+      if (results.some((item) => item.changed)) setHits(null);
       await reload();
     } finally { setUploading(false); }
+  }
+
+  function beginUpdate(document: KnowledgeDocument) {
+    setUpdateTarget(document);
+    setInputMode("file");
+    setFiles([]);
+    setErrors([]);
+    setActionError("");
+    setNotice("");
+    setTextName(document.name.replace(/\.pdf$/i, ".txt"));
+    setTextContent("");
+    uploadSection.current?.scrollIntoView({ block: "start" });
+  }
+
+  function cancelUpdate() {
+    setUpdateTarget(null);
+    setFiles([]);
+    setErrors([]);
+    setActionError("");
+    setTextName("");
+    setTextContent("");
   }
 
   async function startIndexing(document: KnowledgeDocument) {
@@ -145,16 +183,17 @@ export default function KnowledgeBase({ hidden, onBack }: {
     if (uploading) return;
     setActionError("");
     setNotice("");
+    if (updateTarget && candidates.length !== 1) { setErrors(["Choose one document when updating."]); return; }
     const accepted: File[] = [];
     const messages: string[] = [];
-    const existing = new Set(files.map(fileKey));
+    const existing = new Set((updateTarget ? [] : files).map(fileKey));
 
     for (const file of candidates) {
       const extension = `.${file.name.split(".").pop()?.toLowerCase()}`;
-      if (extension !== ".pdf") {
-        messages.push(`${file.name}: choose a PDF document.`);
+      if (!KNOWLEDGE_FILE_ACCEPT.split(",").includes(extension)) {
+        messages.push(`${file.name}: choose a PDF, TXT, or MD document.`);
       } else if (file.size === 0 || file.size > MAX_PDF_BYTES) {
-        messages.push(`${file.name}: choose a nonempty PDF up to 50 MB.`);
+        messages.push(`${file.name}: choose a nonempty document up to 50 MB.`);
       } else if (existing.has(fileKey(file))) {
         messages.push(`${file.name} is already selected.`);
       } else {
@@ -163,7 +202,7 @@ export default function KnowledgeBase({ hidden, onBack }: {
       }
     }
 
-    setFiles((previous) => [...previous, ...accepted]);
+    setFiles((previous) => updateTarget ? accepted : [...previous, ...accepted]);
     setErrors(messages);
   }
 
@@ -191,13 +230,15 @@ export default function KnowledgeBase({ hidden, onBack }: {
         </div>
 
         <div className={styles.sections}>
-          <section className={workspace.panel} aria-labelledby="knowledge-upload-title">
+          <section ref={uploadSection} className={workspace.panel} aria-labelledby="knowledge-upload-title">
             <div className={workspace.panelHeader}>
-              <h2 id="knowledge-upload-title"><span className={workspace.sectionNumber}>01</span>Upload documents</h2>
+              <h2 id="knowledge-upload-title"><span className={workspace.sectionNumber}>01</span>{updateTarget ? "Update document" : "Upload documents"}</h2>
               <span className={workspace.smallMuted}>Store policies, guides & reference material</span>
             </div>
             <div className={styles.uploadBody}>
-              <div
+              {updateTarget && <div className={styles.updateBanner}><div><strong>Updating {updateTarget.name}</strong><p>Version {updateTarget.sourceVersion} · Identical content is skipped. Changed content replaces the original and clears its old vectors.</p></div><button type="button" className={workspace.secondaryButton} disabled={uploading} onClick={cancelUpdate}>Cancel update</button></div>}
+              <div className={styles.inputModes} aria-label="Document source"><button type="button" aria-pressed={inputMode === "file"} disabled={uploading} onClick={() => setInputMode("file")}><Icon name="upload" size={14} />Upload file</button><button type="button" aria-pressed={inputMode === "text"} disabled={uploading} onClick={() => setInputMode("text")}><Icon name="file" size={14} />Paste text</button></div>
+              {inputMode === "file" ? <div
                 className={`${styles.dropzone} ${dragging ? styles.dragging : ""}`}
                 onDragEnter={(event) => { event.preventDefault(); dragDepth.current += 1; setDragging(true); }}
                 onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; }}
@@ -208,13 +249,13 @@ export default function KnowledgeBase({ hidden, onBack }: {
                 <h3>{dragging ? "Drop your documents here" : "A home for your store’s knowledge"}</h3>
                 <p>Drag and drop documents here, or choose files to get started.</p>
                 <button type="button" className={workspace.primaryButton} disabled={uploading} onClick={() => fileInput.current?.click()}><Icon name="upload" size={15} />Choose files</button>
-                <input ref={fileInput} type="file" multiple accept={fileAccept} hidden disabled={uploading} aria-label="Choose knowledge base documents" onChange={(event) => { addFiles(Array.from(event.target.files ?? [])); event.target.value = ""; }} />
-                <span className={styles.fileHint}>PDF · Up to 50 MB per file</span>
-              </div>
+                <input ref={fileInput} type="file" multiple={!updateTarget} accept={KNOWLEDGE_FILE_ACCEPT} hidden disabled={uploading} aria-label="Choose knowledge base documents" onChange={(event) => { addFiles(Array.from(event.target.files ?? [])); event.target.value = ""; }} />
+                <span className={styles.fileHint}>PDF, TXT, MD · UTF-8 text · Up to 50 MB per file</span>
+              </div> : <div className={styles.textEditor}><label htmlFor="knowledge-text-name">Document name<input id="knowledge-text-name" value={textName} disabled={uploading} maxLength={255} placeholder="shipping-policy.txt" onChange={(event) => setTextName(event.target.value)} /></label><label htmlFor="knowledge-text-content">Document text<textarea id="knowledge-text-content" value={textContent} disabled={uploading} rows={8} placeholder="Paste your policy or support text here…" onChange={(event) => setTextContent(event.target.value)} /></label></div>}
 
               {errors.length > 0 && <ul className={styles.errors} role="alert">{errors.map((error, index) => <li key={`${error}-${index}`}>{error}</li>)}</ul>}
 
-              {files.length > 0 && <div className={styles.selected}>
+              {inputMode === "file" && files.length > 0 && <div className={styles.selected}>
                 <div className={styles.selectedHeading}><h3>Selected documents <span>{files.length}</span></h3><button type="button" disabled={uploading} onClick={() => { setFiles([]); setErrors([]); setActionError(""); }}>Clear all</button></div>
                 <ul className={styles.fileList} aria-label="Documents selected for upload">
                   {files.map((file) => <li key={fileKey(file)}>
@@ -226,8 +267,8 @@ export default function KnowledgeBase({ hidden, onBack }: {
               </div>}
 
               <div className={styles.uploadFooter}>
-                <p>PDFs are saved to your knowledge base as pending. Start chunking below to make them searchable.</p>
-                <button type="button" className={workspace.primaryButton} disabled={!files.length || uploading} onClick={() => void uploadDocuments()}><Icon name="upload" size={15} />{uploading ? "Uploading…" : "Upload documents"}</button>
+                <p>{updateTarget ? "Unchanged content keeps its current index. Changes return to pending; start chunking below to rebuild all vectors." : "Documents are saved as pending. Identical uploads are skipped. Start chunking below to make changed content searchable."}</p>
+                <button type="button" className={workspace.primaryButton} disabled={uploading || (inputMode === "file" ? !files.length : !textName.trim() || !textContent.trim())} onClick={() => void uploadDocuments()}><Icon name="upload" size={15} />{uploading ? "Saving…" : updateTarget ? "Save update" : inputMode === "text" ? "Save text" : "Upload documents"}</button>
               </div>
               {actionError && <p className={styles.errors} role="alert">{actionError}</p>}
               {notice && <p className={styles.notice} role="status">{notice}</p>}
@@ -247,14 +288,14 @@ export default function KnowledgeBase({ hidden, onBack }: {
                 <thead><tr><th scope="col">Document name</th><th scope="col">Size</th><th scope="col">Uploaded</th><th scope="col">Status</th><th scope="col">Chunks</th><th scope="col">Action</th></tr></thead>
                 <tbody>
                   {documents.length ? documents.map((document) => <tr key={document.id}>
-                    <td><a className={styles.documentName} href={`/api/knowledge-base/documents/${document.id}/pdf`}><Icon name="file" size={17} />{document.name}</a>{document.errorMessage && <span className={styles.documentError}>{document.errorMessage}</span>}</td>
+                    <td><a className={styles.documentName} href={`/api/knowledge-base/documents/${document.id}/source`}><Icon name="file" size={17} />{document.name}</a><span className={styles.documentHash} title={`Document ID: ${document.id}\nSHA-256: ${document.contentHash}`}>v{document.sourceVersion} · SHA-256 {document.contentHash?.slice(0, 12)}…</span>{document.errorMessage && <span className={styles.documentError}>{document.errorMessage}</span>}</td>
                     <td>{fileSize(document.size)}</td>
                     <td><time dateTime={document.uploadedAt}>{new Intl.DateTimeFormat("en-US", { dateStyle: "medium", timeZone: "America/Los_Angeles" }).format(new Date(document.uploadedAt))}</time></td>
                     <td><Badge tone={document.status === "success" ? "green" : document.status === "failed" ? "red" : document.status === "running" ? "amber" : "neutral"}>{document.status}</Badge></td>
                     <td>{document.status === "success" ? document.chunkCount : "—"}</td>
-                    <td><button type="button" className={`${workspace.secondaryButton} ${styles.indexButton}`} disabled={document.status === "running" || !!startingId} onClick={() => void startIndexing(document)}>{document.status === "running" || startingId === document.id ? "Running…" : document.status === "failed" ? "Retry chunking" : document.status === "success" ? "Reindex" : "Start chunking"}</button></td>
+                    <td><div className={styles.rowActions}><button type="button" className={`${workspace.secondaryButton} ${styles.indexButton}`} disabled={document.status === "running" || !!startingId || uploading} onClick={() => beginUpdate(document)}>Update</button><button type="button" className={`${workspace.secondaryButton} ${styles.indexButton}`} disabled={document.status === "running" || !!startingId || uploading || updateTarget?.id === document.id} onClick={() => void startIndexing(document)}>{document.status === "running" || startingId === document.id ? "Running…" : document.status === "failed" ? "Retry chunking" : document.status === "success" ? "Reindex" : "Start chunking"}</button></div></td>
                   </tr>) : <tr><td colSpan={6}>
-                    <div className={styles.emptyState}><span><Icon name="book" size={28} /></span><h3>{loading ? "Loading documents…" : listError ? "Documents are unavailable" : "No uploaded documents yet"}</h3><p>{listError ? "Check the connection message above, then refresh." : "Upload a PDF above to add it to your knowledge base."}</p></div>
+                    <div className={styles.emptyState}><span><Icon name="book" size={28} /></span><h3>{loading ? "Loading documents…" : listError ? "Documents are unavailable" : "No uploaded documents yet"}</h3><p>{listError ? "Check the connection message above, then refresh." : "Upload a document or paste text above to add it to your knowledge base."}</p></div>
                   </td></tr>}
                 </tbody>
               </table>

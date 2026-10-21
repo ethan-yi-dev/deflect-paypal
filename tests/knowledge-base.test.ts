@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import test, { after, before } from "node:test";
-import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { readFile, readdir } from "node:fs/promises";
 import { PGlite } from "@electric-sql/pglite";
 import { vector } from "@electric-sql/pglite-pgvector";
 import { assertBinding, getBinding, getProviderConfig, KnowledgeError } from "../lib/knowledge/config";
 import type { Database, Sql } from "../lib/knowledge/database";
+import { expectedDocumentHash, readDocumentSource } from "../lib/knowledge/document-http";
+import { prepareFile, prepareText } from "../lib/knowledge/document-source";
 import { chunkPages, createKnowledgeProviders, type KnowledgeProviders } from "../lib/knowledge/providers";
 import { KnowledgeRepository } from "../lib/knowledge/repository";
 import type { ModelBinding } from "../lib/knowledge/types";
@@ -18,7 +20,9 @@ const values = () => [1, ...Array<number>(767).fill(0)];
 
 before(async () => {
   pg = await PGlite.create({ extensions: { vector } });
-  await pg.exec(await readFile("db/migrations/001_knowledge_base.sql", "utf8"));
+  for (const name of (await readdir("db/migrations")).filter((name) => name.endsWith(".sql")).sort()) {
+    await pg.exec(await readFile(`db/migrations/${name}`, "utf8"));
+  }
   db = {
     query: async <T extends object>(text: string, params?: unknown[]) => (await pg.query<T>(text, params)).rows,
     transaction: (work) => pg.transaction((tx) => work(async <T extends object>(text: string, params?: unknown[]) => (await tx.query<T>(text, params)).rows)),
@@ -43,6 +47,8 @@ test("PDF bytes persist in PostgreSQL as pending without creating a job", async 
   assert.equal(document.status, "pending");
   assert.equal(document.chunkCount, 0);
   assert.equal(document.embeddingModel, repo.binding.embeddingModel);
+  assert.equal(document.contentHash, createHash("sha256").update(pdf).digest("hex"));
+  assert.equal(document.sourceVersion, 1);
   assert.deepEqual(Buffer.from((await repo.pdf(document.id)).pdf_data), pdf);
   const [count] = await db.query<{ count: number }>("SELECT count(*)::int AS count FROM t_knowledge_job WHERE doc_id=$1", [document.id]);
   assert.equal(count.count, 0);
@@ -52,8 +58,8 @@ test("PDF bytes persist in PostgreSQL as pending without creating a job", async 
 test("upload rejects renamed non-PDF content and unsupported files", async () => {
   const repo = repository();
   await assert.rejects(repo.upload("policy.pdf", Buffer.from("This is not a PDF")), { code: "INVALID_PDF" });
-  await assert.rejects(repo.upload("policy.txt", pdf), { code: "INVALID_PDF" });
-  await assert.rejects(repo.upload("policy.pdf", new Uint8Array()), { code: "INVALID_PDF" });
+  await assert.rejects(repo.upload("policy.docx", pdf), { code: "INVALID_DOCUMENT" });
+  await assert.rejects(repo.upload("policy.pdf", new Uint8Array()), { code: "INVALID_DOCUMENT" });
 });
 
 test("concurrent CAS requests create exactly one running document and one queued job", async () => {
@@ -121,7 +127,7 @@ test("provider failure marks failed and permits a manual retry", async () => {
   assert.equal(stored.errorMessage, null);
 });
 
-test("reindexing replaces chunks atomically; an embedding failure exposes no partial results", async () => {
+test("reindexing deletes old vectors first; an embedding failure leaves no old or partial results", async () => {
   const repo = repository();
   const document = await repo.upload("policy.pdf", pdf);
   await repo.startIndexing(document.id);
@@ -132,7 +138,7 @@ test("reindexing replaces chunks atomically; an embedding failure exposes no par
   assert.equal((await repo.list()).documents[0].status, "failed");
   assert.equal((await repo.search(values(), repo.binding, 5)).length, 0);
   const [old] = await db.query<{ count: number }>("SELECT count(*)::int AS count FROM t_knowledge_chunk WHERE doc_id=$1", [document.id]);
-  assert.equal(old.count, 2);
+  assert.equal(old.count, 0);
   await repo.startIndexing(document.id);
   await processNextKnowledgeJob(repo, providers({ parse: async () => [{ pageNumber: 3, text: "Updated policy." }] }));
   const hits = await repo.search(values(), repo.binding, 5);
@@ -227,4 +233,143 @@ test("placeholder credentials are rejected and chunking retains page citations",
   assert.ok(chunks.length > 1);
   assert.ok(chunks.every((chunk) => chunk.pageNumber === 4 && chunk.text.trim()));
   assert.throws(() => chunkPages([{ pageNumber: 1, text: "" }]), { code: "EMPTY_DOCUMENT" });
+});
+
+test("identical content returns unchanged and preserves successful vectors, version, and timestamps", async () => {
+  const repo = repository();
+  const document = await repo.upload("policy.pdf", pdf);
+  await repo.startIndexing(document.id);
+  await processNextKnowledgeJob(repo, providers());
+  const before = (await repo.list()).documents[0];
+  const previousHits = await repo.search(values(), repo.binding, 5);
+  const result = await repo.updateDocument(document.id, prepareFile("renamed.pdf", pdf), before.contentHash);
+  assert.equal(result.changed, false);
+  assert.equal(result.operation, "unchanged");
+  assert.match(result.message, /No changes/);
+  assert.deepEqual(result.document, before);
+  assert.deepEqual(await repo.search(values(), repo.binding, 5), previousHits);
+  const duplicate = await repo.createDocument(prepareFile("policy.pdf", pdf));
+  assert.equal(duplicate.changed, false);
+  assert.equal(duplicate.document.id, document.id);
+  assert.equal((await repo.list()).documents.length, 1);
+});
+
+test("changed content keeps doc_id, increments version, and removes all vectors before rebuilding", async () => {
+  const repo = repository();
+  const original = await repo.upload("policy.pdf", pdf);
+  await repo.startIndexing(original.id);
+  await processNextKnowledgeJob(repo, providers());
+  const changed = Buffer.from("%PDF-1.7\nNew delivery policy\n%%EOF");
+  const result = await repo.updateDocument(original.id, prepareFile("policy.pdf", changed), original.contentHash);
+  assert.equal(result.changed, true);
+  assert.equal(result.document.id, original.id);
+  assert.equal(result.document.sourceVersion, 2);
+  assert.equal(result.document.status, "pending");
+  assert.equal(result.document.chunkCount, 0);
+  assert.equal(result.document.indexedAt, null);
+  assert.notEqual(result.document.contentHash, original.contentHash);
+  const [count] = await db.query<{ count: number }>("SELECT count(*)::int AS count FROM t_knowledge_chunk WHERE doc_id=$1", [original.id]);
+  assert.equal(count.count, 0);
+  assert.equal((await repo.search(values(), repo.binding, 5)).length, 0);
+  await repo.startIndexing(original.id);
+  await processNextKnowledgeJob(repo, providers({ parse: async (bytes) => {
+    assert.deepEqual(Buffer.from(bytes), changed);
+    return [{ pageNumber: 1, text: "New delivery policy" }];
+  } }));
+  const hits = await repo.search(values(), repo.binding, 5);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].content, "New delivery policy");
+  assert.equal(hits[0].docId, original.id);
+});
+
+test("identical running updates are no-ops; changed running updates are rejected", async () => {
+  const repo = repository();
+  const document = await repo.upload("policy.pdf", pdf);
+  await repo.startIndexing(document.id);
+  const result = await repo.updateDocument(document.id, prepareFile("policy.pdf", pdf), document.contentHash);
+  assert.equal(result.changed, false);
+  assert.equal(result.document.status, "running");
+  await assert.rejects(repo.updateDocument(document.id, prepareFile("policy.pdf", Buffer.from("%PDF-1.7\nChanged")), document.contentHash), { code: "ALREADY_RUNNING" });
+  const job = (await repo.claimJob())!;
+  assert.deepEqual(Buffer.from((await repo.loadJobDocument(job)).pdf!), pdf);
+});
+
+test("stale browser hashes and concurrent conflicting updates cannot overwrite a newer version", async () => {
+  const repo = repository();
+  const document = await repo.upload("policy.pdf", pdf);
+  const attempts = await Promise.allSettled([
+    repo.updateDocument(document.id, prepareFile("policy.pdf", Buffer.from("%PDF-1.7\nVersion A")), document.contentHash),
+    repo.updateDocument(document.id, prepareFile("policy.pdf", Buffer.from("%PDF-1.7\nVersion B")), document.contentHash),
+  ]);
+  assert.equal(attempts.filter((item) => item.status === "fulfilled").length, 1);
+  const failed = attempts.find((item) => item.status === "rejected");
+  assert.ok(failed?.status === "rejected");
+  assert.equal(failed.reason.code, "DOCUMENT_CHANGED");
+  assert.equal((await repo.list()).documents[0].sourceVersion, 2);
+  const other = repository();
+  await assert.rejects(other.updateDocument(document.id, prepareFile("policy.pdf", pdf), document.contentHash), { code: "DOCUMENT_NOT_FOUND" });
+});
+
+test("concurrent identical uploads produce one document, while changed same-name uploads require an ID update", async () => {
+  const repo = repository();
+  const results = await Promise.all(Array.from({ length: 6 }, () => repo.createDocument(prepareFile("policy.pdf", pdf))));
+  assert.equal(results.filter((item) => item.operation === "created").length, 1);
+  assert.equal(new Set(results.map((item) => item.document.id)).size, 1);
+  await assert.rejects(repo.createDocument(prepareFile("policy.pdf", Buffer.from("%PDF-1.7\nDifferent"))), { code: "DOCUMENT_EXISTS" });
+});
+
+test("rejected replacement rolls back vector deletion and the original document", async () => {
+  const repo = repository();
+  const document = await repo.upload("policy.pdf", pdf);
+  await repo.startIndexing(document.id);
+  await processNextKnowledgeJob(repo, providers());
+  const original = (await repo.list()).documents[0];
+  const source = prepareFile("policy.pdf", Buffer.from("%PDF-1.7\nTampered hash"));
+  await assert.rejects(repo.updateDocument(document.id, { ...source, hash: "0".repeat(64) }, document.contentHash));
+  assert.deepEqual((await repo.list()).documents[0], original);
+  assert.equal((await repo.search(values(), repo.binding, 5)).length, 2);
+});
+
+test("text and Markdown are hashed, stored, and embedded without calling LlamaParse", async () => {
+  const repo = repository();
+  const text = "# Shipping policy\n配送需要三个工作日。";
+  const created = await repo.createDocument(prepareText("shipping.md", text));
+  assert.equal(created.document.contentType, "text/markdown");
+  assert.equal(created.document.contentHash, createHash("sha256").update(text).digest("hex"));
+  assert.equal(Buffer.from((await repo.source(created.document.id)).source_data).toString("utf8"), text);
+  await repo.startIndexing(created.document.id);
+  await processNextKnowledgeJob(repo, providers({ parse: async () => { throw new Error("LlamaParse must not be called for text"); } }));
+  assert.equal((await repo.list()).documents[0].status, "success");
+  const hits = await repo.search(values(), repo.binding, 5);
+  assert.equal(hits[0].content, text);
+  assert.equal(hits[0].pageNumber, 1);
+  const bytes = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from("UTF-8 BOM text")]);
+  const bom = await repo.createDocument(prepareFile("bom.txt", bytes));
+  assert.equal(bom.document.contentHash, createHash("sha256").update(bytes).digest("hex"));
+});
+
+test("a worker cannot load or complete a job whose source hash differs from the document", async () => {
+  const repo = repository();
+  const document = await repo.upload("policy.pdf", pdf);
+  await repo.startIndexing(document.id);
+  const job = (await repo.claimJob())!;
+  await db.query("UPDATE t_knowledge_job SET source_hash=$2 WHERE id=$1", [job.id, "0".repeat(64)]);
+  await assert.rejects(repo.loadJobDocument(job), { code: "STALE_JOB" });
+  await assert.rejects(repo.completeJob(job, [{ text: "Stale text", pageNumber: 1, embedding: values() }]), { code: "STALE_JOB" });
+});
+
+test("HTTP input accepts multipart and JSON text, requires current hashes, and rejects malformed content", async () => {
+  const json = new Request("http://localhost/api", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "policy", text: "Thirty day returns." }) });
+  const source = await readDocumentSource(json);
+  assert.equal(source.name, "policy.txt");
+  assert.equal(source.text, "Thirty day returns.");
+  const form = new FormData();
+  form.set("file", new Blob([pdf], { type: "application/pdf" }), "policy.pdf");
+  assert.equal((await readDocumentSource(new Request("http://localhost/api", { method: "POST", body: form }))).hash, createHash("sha256").update(pdf).digest("hex"));
+  assert.equal(expectedDocumentHash(new Request("http://localhost/api", { headers: { "If-Match": `"${source.hash}"` } })), source.hash);
+  assert.throws(() => expectedDocumentHash(new Request("http://localhost/api")), { code: "HASH_REQUIRED" });
+  assert.throws(() => expectedDocumentHash(new Request("http://localhost/api", { headers: { "If-Match": "bad-hash" } })), { code: "INVALID_HASH" });
+  assert.throws(() => prepareText("policy.txt", "   "), { code: "INVALID_TEXT" });
+  assert.throws(() => prepareFile("bad.txt", Buffer.from([0xff, 0xfe])), { code: "INVALID_TEXT" });
+  await assert.rejects(readDocumentSource(new Request("http://localhost/api", { method: "POST", headers: { "Content-Type": "application/json" }, body: "not json" })), { code: "INVALID_UPLOAD" });
 });
