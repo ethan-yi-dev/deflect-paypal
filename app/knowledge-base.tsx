@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, type DragEvent, type FormEvent } from "react";
-import { KNOWLEDGE_FILE_ACCEPT, MAX_PDF_BYTES, type KnowledgeDeleteResult, type KnowledgeDocument, type KnowledgeList, type KnowledgeWriteResult, type ModelBinding, type SearchHit } from "@/lib/knowledge/types";
+import { KNOWLEDGE_FILE_ACCEPT, MAX_PDF_BYTES, type KnowledgeDeleteResult, type KnowledgeDocument, type KnowledgeList, type KnowledgeRetrieval, type KnowledgeSearchResult, type KnowledgeWriteResult, type ModelBinding, type SearchHit } from "@/lib/knowledge/types";
 import { Badge, Icon } from "./workspace-ui";
 import workspace from "./dispute-workspace.module.css";
 import styles from "./knowledge-base.module.css";
@@ -55,6 +55,7 @@ export default function KnowledgeBase({ hidden, onBack }: {
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState("");
   const [hits, setHits] = useState<SearchHit[] | null>(null);
+  const [retrieval, setRetrieval] = useState<KnowledgeRetrieval | null>(null);
   const [files, setFiles] = useState<File[]>([]);
   const [errors, setErrors] = useState<string[]>([]);
   const [dragging, setDragging] = useState(false);
@@ -188,12 +189,14 @@ export default function KnowledgeBase({ hidden, onBack }: {
     setSearching(true);
     setSearchError("");
     setHits(null);
+    setRetrieval(null);
     try {
-      const result = await readApi<{ hits: SearchHit[] }>("/api/knowledge-base/query", {
+      const result = await readApi<KnowledgeSearchResult>("/api/knowledge-base/query", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query, embeddingModel: binding?.embeddingModel, limit: 5 }),
       });
       setHits(result.hits.filter((hit) => !removedIds.current.has(hit.docId)));
+      setRetrieval(result.retrieval);
     } catch (error) { setSearchError(error instanceof Error ? error.message : "Search failed."); }
     finally { setSearching(false); }
   }
@@ -333,7 +336,9 @@ export default function KnowledgeBase({ hidden, onBack }: {
               <p className={styles.searchHint}>Search is available after a document reaches success.</p>
               {searchError && <p className={styles.errors} role="alert">{searchError}</p>}
               <div role="status" aria-live="polite">{hits && <p className={styles.searchHint}>{hits.length} matching chunk{hits.length === 1 ? "" : "s"} found.</p>}</div>
-              {hits && <ul className={styles.searchResults}>{hits.map((hit) => <li key={hit.id}><div><strong>{hit.documentName}</strong><span>Page {hit.pageNumber} · Similarity {hit.score.toFixed(3)}</span></div><p>{hit.content}</p></li>)}</ul>}
+              {hits && retrieval?.rerankStatus === "applied" && <p className={styles.searchHint}>Reranked {retrieval.candidateCount} candidates with {retrieval.rerankerModel}.</p>}
+              {hits && retrieval?.warning && <p className={styles.searchWarning} role="status">{retrieval.warning}</p>}
+              {hits && <ul className={styles.searchResults}>{hits.map((hit) => <li key={hit.id}><div><strong>{hit.documentName}</strong><span>Page {hit.pageNumber} · {hit.rerankScore !== undefined && <>Rerank {hit.rerankScore.toFixed(3)} · </>}Similarity {hit.score.toFixed(3)}</span></div><p>{hit.content}</p></li>)}</ul>}
             </div>
           </section>
         </div>

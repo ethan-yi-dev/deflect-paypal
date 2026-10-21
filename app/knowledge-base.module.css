@@ -61,6 +61,7 @@
 .searchForm { display: flex; align-items: stretch; gap: 12px; }
 .searchForm input { min-width: 0; flex: 1; padding: 10px 13px; border: 1px solid #dce5d2; border-radius: 6px; color: #344d2f; font-size: 13px; }
 .searchHint { margin-top: 10px; color: #87957b; font-size: 11px; }
+.searchWarning { margin-top: 12px; padding: 10px 12px; border: 1px solid #e8dab9; border-radius: 6px; background: #fcf8ed; color: #8c713a; font-size: 12px; line-height: 1.7; }
 .searchResults { display: grid; gap: 12px; margin-top: 18px; }
 .searchResults li { padding: 15px; border: 1px solid #e6ebde; border-radius: 7px; background: #f8faf4; }
 .searchResults li > div { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; flex-wrap: wrap; }

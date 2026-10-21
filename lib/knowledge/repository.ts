@@ -191,18 +191,40 @@ export class KnowledgeRepository {
   }
 
   async search(vector: number[], requestedBinding: ModelBinding, limit: number): Promise<SearchHit[]> {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 20) throw new KnowledgeError("INVALID_LIMIT", "Search limit must be between 1 and 20.", 400);
+    return this.searchCandidates(vector, requestedBinding, limit);
+  }
+
+  async searchCandidates(vector: number[], requestedBinding: ModelBinding, limit: number): Promise<SearchHit[]> {
     const b = await this.ensureBase();
     assertBinding(requestedBinding, b);
     validateVector(vector, b.embeddingDimensions);
-    if (!Number.isInteger(limit) || limit < 1 || limit > 20) throw new KnowledgeError("INVALID_LIMIT", "Search limit must be between 1 and 20.", 400);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new KnowledgeError("INVALID_CANDIDATE_LIMIT", "Retrieve between 1 and 100 candidates.", 400);
     // The dimension interpolation is a validated integer; all user data remains parameterized.
     const expression = b.embeddingDimensions === 768 ? "c.embedding::vector(768)" : "c.embedding";
-    return this.db.query<SearchHit>(`SELECT c.id, c.doc_id AS "docId", d.name AS "documentName", c.content,
-      c.page_number AS "pageNumber", 1 - (${expression} <=> $1::vector) AS score
-      FROM t_knowledge_chunk c JOIN t_knowledge_document d ON d.id=c.doc_id
-      WHERE c.knowledge_base_id=$2 AND c.embedding_model=$3 AND c.embedding_dimensions=$4
-      ${b.embeddingDimensions === 768 ? "AND c.embedding_dimensions=768" : ""}
-      AND d.status='success' AND d.deleted_at IS NULL AND d.embedding_model=$3 AND d.embedding_dimensions=$4
-      ORDER BY ${expression} <=> $1::vector LIMIT $5`, [JSON.stringify(vector), b.id, b.embeddingModel, b.embeddingDimensions, limit]);
+    return this.db.transaction(async (sql) => {
+      // pgvector >= 0.8.0: keep scanning when retained soft-deleted chunks or
+      // other base/model filters eliminate early HNSW matches. Settings stay local.
+      await sql("SET LOCAL hnsw.iterative_scan = 'strict_order'");
+      await sql(`SET LOCAL hnsw.ef_search = ${Math.max(40, limit * 2)}`);
+      return sql<SearchHit>(`SELECT c.id, c.doc_id AS "docId", d.name AS "documentName", c.content,
+        c.page_number AS "pageNumber", 1 - (${expression} <=> $1::vector) AS score
+        FROM t_knowledge_chunk c JOIN t_knowledge_document d ON d.id=c.doc_id
+        WHERE c.knowledge_base_id=$2 AND c.embedding_model=$3 AND c.embedding_dimensions=$4
+        ${b.embeddingDimensions === 768 ? "AND c.embedding_dimensions=768" : ""}
+        AND d.status='success' AND d.deleted_at IS NULL AND d.embedding_model=$3 AND d.embedding_dimensions=$4
+        ORDER BY ${expression} <=> $1::vector LIMIT $5`, [JSON.stringify(vector), b.id, b.embeddingModel, b.embeddingDimensions, limit]);
+    });
+  }
+
+  async retainSearchableHits(hits: SearchHit[]): Promise<SearchHit[]> {
+    if (!hits.length) return [];
+    const b = this.binding;
+    const rows = await this.db.query<{ id: string }>(`SELECT c.id FROM t_knowledge_chunk c JOIN t_knowledge_document d ON d.id=c.doc_id
+      WHERE c.id=ANY($1::uuid[]) AND c.knowledge_base_id=$2 AND c.embedding_model=$3 AND c.embedding_dimensions=$4
+      AND d.status='success' AND d.deleted_at IS NULL AND d.embedding_model=$3 AND d.embedding_dimensions=$4`,
+    [hits.map((hit) => hit.id), b.id, b.embeddingModel, b.embeddingDimensions]);
+    const eligible = new Set(rows.map((row) => row.id));
+    return hits.filter((hit) => eligible.has(hit.id));
   }
 }

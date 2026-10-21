@@ -154,6 +154,11 @@ manual rebuilding. **Delete** soft-deletes a document: its original content,
 chunks, vectors, and job history stay in PostgreSQL, while the document disappears
 from the list and all retrieval results. The same name can be uploaded again as a
 new document. Only successful, active documents participate in **Search your knowledge**.
+Search retrieves up to 50 vector candidates by default, reranks them with Cohere,
+and returns the final top 5 with both similarity and rerank scores. Add
+`COHERE_API_KEY` to `.env.local` to enable reranking; missing keys or provider
+failures keep vector search available with an explicit warning. Existing
+embeddings do not need rebuilding.
 
 Run the PostgreSQL migration and the separate worker before indexing. The full
 [knowledge-base guide](documents/knowledge-base.md) explains configuration, tables,

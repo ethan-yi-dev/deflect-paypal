@@ -35,3 +35,18 @@ export function getProviderConfig(env: Record<string, string | undefined> = proc
   }
   return { geminiKey, llamaKey, tier };
 }
+
+export function getRerankConfig(env: Record<string, string | undefined> = process.env) {
+  const key = env.COHERE_API_KEY?.trim();
+  const model = env.COHERE_RERANK_MODEL?.trim() || "rerank-v4.0-fast";
+  const candidateCount = Number(env.KNOWLEDGE_RERANK_CANDIDATES || 50);
+  const timeoutMs = Number(env.KNOWLEDGE_RERANK_TIMEOUT_MS || 10000);
+  if (!/^rerank-[a-z0-9._-]{1,100}$/i.test(model)
+      || !Number.isInteger(candidateCount) || candidateCount < 20 || candidateCount > 100
+      || !Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 60000) {
+    throw new KnowledgeError("INVALID_RERANK_CONFIG", "Set a rerank model, 20–100 candidates, and a timeout between 100 and 60000 ms.", 503);
+  }
+  return { apiKey: key && key !== "anyword" ? key : null, model, candidateCount, timeoutMs };
+}
+
+export type RerankConfig = ReturnType<typeof getRerankConfig>;

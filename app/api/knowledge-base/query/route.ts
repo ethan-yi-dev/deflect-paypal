@@ -1,5 +1,7 @@
-import { assertBinding, getProviderConfig, KnowledgeError } from "@/lib/knowledge/config";
+import { assertBinding, getProviderConfig, getRerankConfig, KnowledgeError } from "@/lib/knowledge/config";
 import { createKnowledgeProviders } from "@/lib/knowledge/providers";
+import { createCohereReranker } from "@/lib/knowledge/reranker";
+import { retrieveKnowledge } from "@/lib/knowledge/retrieval";
 import { knowledgeErrorResponse, knowledgeHeaders, knowledgeRepository, requireSameOrigin } from "@/lib/knowledge/server";
 
 export const runtime = "nodejs";
@@ -21,8 +23,11 @@ export async function POST(request: Request) {
       if (typeof input.embeddingModel !== "string") throw new KnowledgeError("INVALID_QUERY", "embeddingModel must be a string.", 400);
       assertBinding({ ...binding, embeddingModel: input.embeddingModel }, binding);
     }
-    const vector = await createKnowledgeProviders(binding, getProviderConfig()).embed(input.query.trim(), "query", "", request.signal);
-    const hits = await repository.search(vector, binding, limit);
-    return Response.json({ knowledgeBase: binding, hits }, { headers: knowledgeHeaders });
+    const config = getRerankConfig();
+    const result = await retrieveKnowledge({
+      query: input.query.trim(), limit, signal: request.signal, repository, config,
+      providers: createKnowledgeProviders(binding, getProviderConfig()), reranker: createCohereReranker(config),
+    });
+    return Response.json(result, { headers: knowledgeHeaders });
   } catch (error) { return knowledgeErrorResponse(error); }
 }

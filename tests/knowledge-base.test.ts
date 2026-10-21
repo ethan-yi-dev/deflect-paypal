@@ -4,12 +4,13 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import { PGlite } from "@electric-sql/pglite";
 import { vector } from "@electric-sql/pglite-pgvector";
-import { assertBinding, getBinding, getProviderConfig, KnowledgeError } from "../lib/knowledge/config";
+import { assertBinding, getBinding, getProviderConfig, getRerankConfig, KnowledgeError } from "../lib/knowledge/config";
 import type { Database, Sql } from "../lib/knowledge/database";
 import { expectedDocumentHash, readDocumentSource } from "../lib/knowledge/document-http";
 import { prepareFile, prepareText } from "../lib/knowledge/document-source";
 import { chunkPages, createKnowledgeProviders, type KnowledgeProviders } from "../lib/knowledge/providers";
 import { KnowledgeRepository } from "../lib/knowledge/repository";
+import { retrieveKnowledge } from "../lib/knowledge/retrieval";
 import type { ModelBinding } from "../lib/knowledge/types";
 import { processNextKnowledgeJob } from "../lib/knowledge/worker";
 
@@ -507,4 +508,49 @@ test("all migrations can be reapplied with retained same-name documents", async 
   assert.deepEqual(await db.query("SELECT * FROM t_knowledge_document WHERE knowledge_base_id=$1 ORDER BY id", [repo.binding.id]), before);
   assert.deepEqual((await repo.list()).documents.map((document) => document.id), [active.id]);
   await assert.rejects(repo.createDocument(prepareFile("policy.pdf", Buffer.from("%PDF-1.7\nChanged"))), { code: "DOCUMENT_EXISTS" });
+});
+
+test("vector candidate retrieval can exceed 20 hits and keeps final limits separate", async () => {
+  const repo = repository();
+  const document = await repo.upload("many-chunks.pdf", pdf);
+  await repo.startIndexing(document.id);
+  const job = (await repo.claimJob())!;
+  await repo.completeJob(job, Array.from({ length: 60 }, (_, index) => ({ text: `Candidate ${index}`, pageNumber: index + 1, embedding: values() })));
+  assert.equal((await repo.searchCandidates(values(), repo.binding, 50)).length, 50);
+  assert.equal((await repo.search(values(), repo.binding, 20)).length, 20);
+  await assert.rejects(repo.search(values(), repo.binding, 21), { code: "INVALID_LIMIT" });
+  await assert.rejects(repo.searchCandidates(values(), repo.binding, 101), { code: "INVALID_CANDIDATE_LIMIT" });
+  const other = repository();
+  assert.deepEqual(await other.searchCandidates(values(), other.binding, 50), []);
+  await repo.deleteDocument(document.id);
+  assert.deepEqual(await repo.searchCandidates(values(), repo.binding, 50), []);
+});
+
+test("reranking rechecks chunk IDs after concurrent soft deletion and a completed source replacement", async () => {
+  const repo = repository();
+  const removed = await repo.upload("removed.pdf", pdf);
+  const replaced = await repo.upload("replaced.pdf", pdf);
+  const kept = await repo.upload("kept.pdf", pdf);
+  for (const document of [removed, replaced, kept]) {
+    await repo.startIndexing(document.id);
+    await processNextKnowledgeJob(repo, providers());
+  }
+  const result = await retrieveKnowledge({
+    repository: repo, providers: providers(), config: getRerankConfig({ COHERE_API_KEY: "test-cohere-key" }),
+    query: "What is the return policy?", limit: 2, signal: new AbortController().signal,
+    reranker: async (_query, candidates) => {
+      assert.equal(candidates.length, 6);
+      await repo.deleteDocument(removed.id);
+      await repo.updateDocument(replaced.id, prepareFile("replaced.pdf", Buffer.from("%PDF-1.7\nNew source")), replaced.contentHash);
+      await repo.startIndexing(replaced.id);
+      await processNextKnowledgeJob(repo, providers({ parse: async () => [{ text: "Fresh replacement", pageNumber: 1 }] }));
+      return candidates.map((hit) => ({ ...hit, rerankScore: hit.docId === kept.id ? 0.5 : 0.9 }))
+        .sort((a, b) => b.rerankScore - a.rerankScore);
+    },
+  });
+  assert.equal(result.retrieval.rerankStatus, "applied");
+  assert.equal(result.hits.length, 2);
+  assert.ok(result.hits.every((hit) => hit.docId === kept.id));
+  assert.ok((await repo.list()).documents.find((document) => document.id === replaced.id)?.status === "success");
+  assert.equal((await repo.search(values(), repo.binding, 5)).filter((hit) => hit.docId === replaced.id).length, 1);
 });

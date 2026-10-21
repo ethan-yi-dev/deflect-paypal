@@ -23,4 +23,12 @@ export type KnowledgeDeleteResult = { id: string; deletedAt: string; message: st
 export type KnowledgeList = { knowledgeBase: ModelBinding; documents: KnowledgeDocument[] };
 export type ParsedPage = { pageNumber: number; text: string };
 export type KnowledgeChunk = ParsedPage & { embedding: number[] };
-export type SearchHit = { id: string; docId: string; documentName: string; content: string; pageNumber: number; score: number };
+// score remains the original cosine similarity for existing API consumers.
+export type SearchHit = { id: string; docId: string; documentName: string; content: string; pageNumber: number; score: number; rerankScore?: number };
+export type KnowledgeRetrieval = {
+  rerankStatus: "applied" | "not_configured" | "unavailable" | "empty";
+  rerankerModel: string | null;
+  candidateCount: number;
+  warning: string | null;
+};
+export type KnowledgeSearchResult = { knowledgeBase: ModelBinding; hits: SearchHit[]; retrieval: KnowledgeRetrieval };

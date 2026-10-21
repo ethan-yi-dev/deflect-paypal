@@ -9,7 +9,7 @@ vector database, Redis service, or browser storage is required.
 1. Install dependencies with `npm install`.
 2. Add the values in [`.env.example`](../.env.example) to your existing `.env.local`.
    Keep the existing PayPal credentials. Replace `anyword` API keys with real keys.
-3. Start a PostgreSQL server with pgvector installed. If Docker is available, the
+3. Start a PostgreSQL server with pgvector 0.8.0 or newer installed. If Docker is available, the
    supplied development server can be started with:
 
    ```sh
@@ -47,6 +47,8 @@ and Google for embeddings; saving a source does not invoke paid providers.
 Click a document name to download its
 stored original. **Search your knowledge** returns matching chunks and page
 citations; it does not generate an LLM answer or change dispute recommendations.
+Search first retrieves vector candidates, then uses Cohere to rerank them when
+`COHERE_API_KEY` is configured. No embedding rebuild is required to enable reranking.
 
 ## Configuration and model binding
 
@@ -59,6 +61,10 @@ citations; it does not generate an LLM answer or change dispute recommendations.
 | `GEMINI_EMBEDDING_DIMENSIONS` | Defaults to `768`; integer from 1 to 3072. |
 | `LLAMA_CLOUD_API_KEY` | LlamaParse key, sent only on the server in `Authorization: Bearer ...`. |
 | `LLAMA_PARSE_TIER` | Defaults to `agentic`; also supports `fast`, `cost_effective`, and `agentic_plus`. |
+| `COHERE_API_KEY` | Cohere key, sent only on the server as `Authorization: Bearer ...`. Missing or `anyword` falls back to vector ordering with a visible warning. |
+| `COHERE_RERANK_MODEL` | Defaults to the multilingual `rerank-v4.0-fast`; independent of the bound embedding model. |
+| `KNOWLEDGE_RERANK_CANDIDATES` | Internal vector candidate count, defaults to `50`; integer from 20 to 100. Separate from the final query `limit`. |
+| `KNOWLEDGE_RERANK_TIMEOUT_MS` | Cohere request timeout including response parsing, defaults to `10000`; integer from 100 to 60000. |
 
 The first use binds `embedding_model` and `embedding_dimensions` to
 `t_knowledge_base`. A database trigger forbids changing that binding. Documents
@@ -202,6 +208,56 @@ in flight may finish, but their results cannot be stored or reactivate the
 document. Removing a document after indexing finishes preserves its successful
 status and vectors while excluding them from search.
 
+## Retrieval and reranking
+
+```text
+Query -> bound Google query embedding -> pgvector candidates (default 50)
+      -> Cohere rerank -> recheck current chunk eligibility -> final top K (default 5)
+```
+
+Add `COHERE_API_KEY=<your real key>` to `.env.local` using the placeholders and
+optional settings in `.env.example`. Restart the development server after changing
+environment configuration. The default reranker is `rerank-v4.0-fast`, using
+`POST https://api.cohere.com/v2/rerank`. Both Chinese and English questions can be
+sent directly to the multilingual model. This step runs during search, without
+changing existing embeddings, document status, chunks, or indexing jobs.
+
+The server sends the query plus each candidate's title and chunk text in one
+request. `top_n` equals the candidate count so the complete ranking is available
+for final filtering. Provider indices must be unique, in range, and cover every
+candidate; scores must be finite numbers between 0 and 1. Results map back to the
+original chunk IDs, document IDs, text, and page citations. Untrusted provider
+text never replaces stored content.
+
+Vector retrieval requires the configured base, model/dimensions, `success`, and
+`deleted_at IS NULL`. Transaction-local HNSW iterative scanning and a larger search
+candidate list help prevent those filters from exhausting the first index matches.
+After the remote request, the server rechecks the exact chunk IDs against the
+current database. A document deleted or replaced during reranking cannot return
+stale content. Final `limit` is applied after this check, allowing lower-ranked
+eligible candidates to fill the response.
+
+Each hit keeps `score` as its original cosine similarity. A successfully reranked
+hit also has `rerankScore`; results are ordered by that score, while the UI shows
+both values. Neither score is an answer-confidence probability. This release
+does not impose a relevance threshold; calibrate one against labeled business
+queries before enabling filtering.
+
+The query response includes `retrieval` metadata:
+
+| Field | Meaning |
+| --- | --- |
+| `rerankStatus` | `applied`, `not_configured`, `unavailable`, or `empty`. |
+| `rerankerModel` | Model actually used for successful reranking; otherwise `null`. |
+| `candidateCount` | Actual number of vector candidates before final filtering and truncation. |
+| `warning` | Visible explanation of vector-only fallback; otherwise `null`. |
+
+An absent/placeholder key skips Cohere. A provider HTTP error, timeout, or malformed
+response returns the original vector ordering with an explicit warning and no
+`rerankScore`. Raw provider payloads and keys are not returned. Empty candidate
+sets skip Cohere, and client cancellation aborts reranking instead of initiating
+a fallback. There are no automatic Cohere retries or cached relevance scores.
+
 ## API
 
 All responses use `private, no-store`. The routes run in the Node.js runtime.
@@ -214,7 +270,7 @@ All responses use `private, no-store`. The routes run in the Node.js runtime.
 | `DELETE /api/knowledge-base/documents/{id}` | Soft-deletes within the configured base; 200 with `id`, `deletedAt`, and a message, including repeated deletes. Unknown/other-base IDs return 404. No provider calls. |
 | `POST /api/knowledge-base/documents/{id}/index` | CAS + durable enqueue; returns 202, or 409 if running. |
 | `GET /api/knowledge-base/documents/{id}/source` | Downloads original bytes with the stored MIME type. The earlier `/pdf` route remains an alias. |
-| `POST /api/knowledge-base/query` | JSON `query`, optional `embeddingModel`, optional `limit` (1–20); returns chunks with cosine similarity and source pages. |
+| `POST /api/knowledge-base/query` | JSON `query`, optional `embeddingModel`, optional final `limit` (1–20); returns chunks with cosine similarity, optional rerank score, source pages, and `retrieval` metadata. |
 
 Example query body:
 
@@ -246,7 +302,9 @@ stale-worker fencing, hash comparisons, duplicate uploads, concurrent updates,
 full vector replacement, text inputs, soft-delete retention and retrieval exclusion,
 idempotent deletion, same-name reuploads, removal during indexing, repeatable migrations,
 immutable models, dimensions, query scoping, page citations,
-and mocked official provider request/response contracts. They require no database
+candidate retrieval above the final top K, reranking, timeout/fallback, malformed
+rankings, cancellation, post-rerank eligibility checks, and mocked official
+provider request/response contracts. They require no database
 service, external credentials, paid API calls, or access to `.env.local`.
 
 Real provider authentication, quotas, PDF parsing quality, and deployment network
@@ -257,4 +315,7 @@ access still need verification after real credentials and PostgreSQL are configu
 - [LlamaParse v2 upload/parse/poll](https://developers.llamaindex.ai/llamaparse/parse/getting_started/)
 - [LlamaParse response format](https://developers.llamaindex.ai/llamaparse/parse/guides/response-format/)
 - [Google embedding API and task formats](https://ai.google.dev/gemini-api/docs/embeddings)
+- [Cohere Rerank v2 API](https://docs.cohere.com/reference/rerank)
+- [Cohere multilingual reranking](https://docs.cohere.com/docs/rerank-overview)
+- [Cohere score interpretation and threshold calibration](https://docs.cohere.com/docs/reranking-best-practices)
 - [pgvector operators and expression indexes](https://github.com/pgvector/pgvector)
