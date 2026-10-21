@@ -24,6 +24,7 @@ Built with Next.js, React, and TypeScript for the
 | Deflect assessment | Checks draft completeness and returns a rule-based suggestion about missing evidence or review steps. |
 | PayPal submission | Opens a review preview when the case offers evidence submission; sends no evidence or action requests. |
 | Demo studio | Offers three fixed scenarios with predefined recommendations, Policy/JEV results, and a simulated audit trail. |
+| Knowledge base | Opens from **Customize Your own knowledge base** in the sidebar. Supports local document selection, drag and drop, validation, and removal; reserves an uploaded-document table for the future database integration. Upload and storage are not connected yet. |
 
 The support details use neutral cards. **Evidence & next steps** is a separate
 **ACTION WORKSPACE**, with a dark green header, highlighted border, and its own

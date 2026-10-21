@@ -4,9 +4,11 @@ import { useRef, useState, type FormEvent } from "react";
 import { demoDispute as dispute, demoScenarios, initialAudit, type ScenarioId } from "./demo-dispute";
 import { Badge, Fact, Icon } from "./workspace-ui";
 import LiveDisputeWorkspace from "./live-dispute-workspace";
+import KnowledgeBase, { KnowledgeBaseButton } from "./knowledge-base";
 import styles from "./dispute-workspace.module.css";
 
 function DemoWorkspace({ onShowLive }: { onShowLive: () => void }) {
+  const [knowledgeBaseOpen, setKnowledgeBaseOpen] = useState(false);
   const [caseId, setCaseId] = useState(dispute.id);
   const [scenarioId, setScenarioId] = useState<ScenarioId>("missing");
   const [activeTab, setActiveTab] = useState("overview");
@@ -64,13 +66,14 @@ function DemoWorkspace({ onShowLive }: { onShowLive: () => void }) {
 
   return (
     <div className={styles.app}>
-      <a className={styles.skipLink} href="#workspace">Skip to workspace</a>
+      <a className={styles.skipLink} href={knowledgeBaseOpen ? "#knowledge-base-workspace" : "#workspace"}>Skip to workspace</a>
       <aside className={styles.sidebar} aria-label="Workspace navigation">
-        <a className={styles.brand} href="#workspace" aria-label="Deflect workspace"><span className={styles.brandMark}><Icon name="shield" size={24} /></span>deflect<span className={styles.brandDot}>.</span></a>
+        <a className={styles.brand} href="#workspace" aria-label="Deflect workspace" onClick={() => setKnowledgeBaseOpen(false)}><span className={styles.brandMark}><Icon name="shield" size={24} /></span>deflect<span className={styles.brandDot}>.</span></a>
         <span className={styles.sidebarCaption}>THE DISPUTE WORKSPACE</span>
+        <KnowledgeBaseButton active={knowledgeBaseOpen} onClick={() => setKnowledgeBaseOpen(true)} />
         <nav className={styles.nav}>
-          <a className={styles.navActive} href="#workspace"><Icon name="grid" />Workspace<span className={styles.navCount}>01</span></a>
-          <a href="#audit"><Icon name="history" />Audit trail<Icon name="chevron" size={14} /></a>
+          <a className={knowledgeBaseOpen ? "" : styles.navActive} href="#workspace" onClick={() => setKnowledgeBaseOpen(false)}><Icon name="grid" />Workspace<span className={styles.navCount}>01</span></a>
+          <a href="#audit" onClick={() => setKnowledgeBaseOpen(false)}><Icon name="history" />Audit trail<Icon name="chevron" size={14} /></a>
         </nav>
         <div className={styles.sidebarCase}><span className={styles.sidebarLabel}>ACTIVE CASE</span><div className={styles.caseDot}>Item not received</div><code>{dispute.id}</code><span className={styles.sidebarAmount}>$10.00 <span>USD</span></span></div>
         <div className={styles.sidebarBottom}>
@@ -79,7 +82,8 @@ function DemoWorkspace({ onShowLive }: { onShowLive: () => void }) {
         </div>
       </aside>
 
-      <main id="workspace" className={styles.main}>
+      <KnowledgeBase hidden={!knowledgeBaseOpen} onBack={() => setKnowledgeBaseOpen(false)} />
+      <main id="workspace" className={styles.main} hidden={knowledgeBaseOpen}>
         <header className={styles.topbar}><div className={styles.breadcrumb}>Workspace<Icon name="chevron" size={13} /><span>Disputes</span></div><div className={styles.topbarRight}><button className={styles.sourceSwitch} onClick={onShowLive}>View PayPal disputes<Icon name="arrow" size={14} /></button><span className={styles.demoLabel}><span className={styles.liveDot} />Static demo</span></div></header>
         <div className={styles.content}>
           <div className={styles.pageHeading}><div><div className={styles.eyebrow}>CLARITY AT EVERY STEP</div><h1>Dispute workspace<span>.</span></h1><p>From customer concern to a considered next step.</p></div><span className={styles.modePill}><Icon name="lock" size={14} />Sandbox / Dry run</span></div>

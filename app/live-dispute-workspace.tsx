@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from "react"
 import type { DisputeDetailResult, DisputeListResult, DisputeSummary, Money } from "@/lib/disputes";
 import { Badge, Fact, Icon } from "./workspace-ui";
 import DisputeEvidence, { EMPTY_CASE_EVIDENCE, type CaseEvidenceDraft } from "./dispute-evidence";
+import KnowledgeBase, { KnowledgeBaseButton } from "./knowledge-base";
 import styles from "./dispute-workspace.module.css";
 
 const timeZone = "America/Los_Angeles";
@@ -66,6 +67,7 @@ async function readApi<T>(url: string, signal: AbortSignal): Promise<T> {
 }
 
 export default function LiveDisputeWorkspace({ onShowDemo }: { onShowDemo: () => void }) {
+  const [knowledgeBaseOpen, setKnowledgeBaseOpen] = useState(false);
   const [caseId, setCaseId] = useState("");
   const [currentCaseId, setCurrentCaseId] = useState("");
   const [items, setItems] = useState<DisputeSummary[]>([]);
@@ -169,15 +171,16 @@ export default function LiveDisputeWorkspace({ onShowDemo }: { onShowDemo: () =>
 
   return (
     <div className={styles.app}>
-      <a className={styles.skipLink} href="#workspace">Skip to workspace</a>
+      <a className={styles.skipLink} href={knowledgeBaseOpen ? "#knowledge-base-workspace" : "#workspace"}>Skip to workspace</a>
       <aside className={`${styles.sidebar} ${styles.liveSidebar}`} aria-label="Workspace navigation">
-        <a className={styles.brand} href="#workspace" aria-label="Deflect workspace">
+        <a className={styles.brand} href="#workspace" aria-label="Deflect workspace" onClick={() => setKnowledgeBaseOpen(false)}>
           <span className={styles.brandMark}><Icon name="shield" size={24} /></span>deflect<span className={styles.brandDot}>.</span>
         </a>
         <span className={styles.sidebarCaption}>THE DISPUTE WORKSPACE</span>
+        <KnowledgeBaseButton active={knowledgeBaseOpen} onClick={() => setKnowledgeBaseOpen(true)} />
         <nav className={styles.nav}>
-          <a className={styles.navActive} href="#workspace"><Icon name="grid" />Workspace<span className={styles.navCount}>{String(items.length).padStart(2, "0")}</span></a>
-          <a href="#case-activity"><Icon name="history" />Case activity<Icon name="chevron" size={14} /></a>
+          <a className={knowledgeBaseOpen ? "" : styles.navActive} href="#workspace" onClick={() => setKnowledgeBaseOpen(false)}><Icon name="grid" />Workspace<span className={styles.navCount}>{String(items.length).padStart(2, "0")}</span></a>
+          <a href="#case-activity" onClick={() => setKnowledgeBaseOpen(false)}><Icon name="history" />Case activity<Icon name="chevron" size={14} /></a>
         </nav>
         <section className={styles.caseDirectory} aria-labelledby="active-cases-title">
           <div className={styles.caseDirectoryHeading}>
@@ -186,7 +189,7 @@ export default function LiveDisputeWorkspace({ onShowDemo }: { onShowDemo: () =>
           </div>
           {items.length ? <ul className={styles.caseList}>
             {items.map((item) => <li key={item.id}>
-              <button className={styles.caseListButton} aria-label={`View dispute ${item.id}`} aria-pressed={currentCaseId === item.id} onClick={() => startQuery(item.id)}>
+              <button className={styles.caseListButton} aria-label={`View dispute ${item.id}`} aria-pressed={!knowledgeBaseOpen && currentCaseId === item.id} onClick={() => { setKnowledgeBaseOpen(false); startQuery(item.id); }}>
                 <code>{item.id}</code>
                 <span className={styles.caseListReason}>{label(item.reason)}</span>
                 <strong>{money(item.amount)}</strong>
@@ -208,7 +211,8 @@ export default function LiveDisputeWorkspace({ onShowDemo }: { onShowDemo: () =>
         </div>
       </aside>
 
-      <main id="workspace" className={styles.main}>
+      <KnowledgeBase hidden={!knowledgeBaseOpen} onBack={() => setKnowledgeBaseOpen(false)} />
+      <main id="workspace" className={styles.main} hidden={knowledgeBaseOpen}>
         <header className={styles.topbar}>
           <div className={styles.breadcrumb}>Workspace<Icon name="chevron" size={13} /><span>Disputes</span></div>
           <div className={styles.topbarRight}>

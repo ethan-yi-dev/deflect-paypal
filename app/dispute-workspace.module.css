@@ -12,6 +12,13 @@
 .brandMark { display: grid; place-items: center; width: 33px; height: 38px; color: var(--lime); }
 .brandDot { margin-left: -8px; color: var(--lime); }
 .sidebarCaption { padding: 12px 11px 0; color: #8ca194; font-size: 10px; letter-spacing: 1.5px; }
+.knowledgeButton { display: flex; align-items: center; gap: 10px; width: 100%; margin-top: 27px; padding: 12px; border: 1px solid #60764e; border-radius: 7px; background: #304e37; color: #deebc9; text-align: left; font-size: 12px !important; line-height: 1.5; }
+.knowledgeButton > svg { flex-shrink: 0; color: #c6e69a; }
+.knowledgeButton > span { flex: 1; }
+.knowledgeButton:hover { background: #3b5a40; border-color: #9ebc77; }
+.knowledgeButton[aria-pressed="true"] { background: var(--lime); color: #213c2e; border-color: var(--lime); }
+.knowledgeButton[aria-pressed="true"] > svg { color: #49662e; }
+.knowledgeButton + .nav { margin-top: 18px; }
 .nav { display: grid; gap: 7px; margin-top: 45px; }
 .nav a { display: flex; align-items: center; gap: 12px; padding: 12px 14px; color: #adbcaf; border-radius: 7px; font-size: 14px; font-weight: 500; text-decoration: none; }
 .nav a > svg:last-child { margin-left: auto; }
@@ -384,3 +391,9 @@
   .caseListButton strong { font-size: 16px; }
 }
 @media (prefers-reduced-motion: reduce) { .app button { transition: none; } }
+@media (max-width: 650px) {
+  .sidebar { flex-wrap: wrap; }
+  .knowledgeButton { order: 1; margin-top: 0; padding: 10px 12px; }
+  .knowledgeButton + .nav { margin-top: 0; }
+  .caseDirectory { order: 2; }
+}

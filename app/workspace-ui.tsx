@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import styles from "./dispute-workspace.module.css";
 
-type IconName = "shield" | "grid" | "history" | "arrow" | "refresh" | "sparkles" | "check" | "alert" | "message" | "box" | "truck" | "chevron" | "close" | "file" | "lock";
+type IconName = "shield" | "grid" | "history" | "arrow" | "refresh" | "sparkles" | "check" | "alert" | "message" | "box" | "truck" | "chevron" | "close" | "file" | "lock" | "book" | "upload";
 
 export function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
   const paths: Record<IconName, ReactNode> = {
@@ -20,6 +20,8 @@ export function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
     close: <path d="m6 6 12 12M6 18 18 6" />,
     file: <><path d="M14 2H5v20h14V7l-5-5Zm0 0v5h5" /><path d="M8 12h8M8 16h6" /></>,
     lock: <><rect x="5" y="10" width="14" height="11" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 5v2" /></>,
+    book: <><path d="M12 5v16M3 3h5a4 4 0 0 1 4 2 4 4 0 0 1 4-2h5v16h-5a4 4 0 0 0-4 2 4 4 0 0 0-4-2H3V3Z" /></>,
+    upload: <><path d="M12 16V3m-5 5 5-5 5 5M4 16v5h16v-5" /></>,
   };
   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
 }
