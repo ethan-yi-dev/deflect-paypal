@@ -24,7 +24,7 @@ Built with Next.js, React, and TypeScript for the
 | Deflect assessment | Checks draft completeness and returns a rule-based suggestion about missing evidence or review steps. |
 | PayPal submission | Opens a review preview when the case offers evidence submission; sends no evidence or action requests. |
 | Demo studio | Offers three fixed scenarios with predefined recommendations, Policy/JEV results, and a simulated audit trail. |
-| Knowledge base | Opens from **Customize Your own knowledge base** in the sidebar. Supports local document selection, drag and drop, validation, and removal; reserves an uploaded-document table for the future database integration. Upload and storage are not connected yet. |
+| Knowledge base | Stores PDFs in PostgreSQL, runs manual asynchronous indexing through LlamaParse + LlamaIndex + Google embeddings, and searches chunks with pgvector. Includes status polling, retries, and model binding. See [setup](documents/knowledge-base.md). |
 
 The support details use neutral cards. **Evidence & next steps** is a separate
 **ACTION WORKSPACE**, with a dark green header, highlighted border, and its own
@@ -46,19 +46,19 @@ the details.
 npm install
 ```
 
-Create `.env.local` from [env.example](env.example) if it does not already exist.
+Create `.env.local` from [.env.example](.env.example) if it does not already exist.
 Keep your existing `.env.local` when it is already configured.
 
 PowerShell:
 
 ```powershell
-if (!(Test-Path .env.local)) { Copy-Item env.example .env.local }
+if (!(Test-Path .env.local)) { Copy-Item .env.example .env.local }
 ```
 
 Bash:
 
 ```bash
-test -f .env.local || cp env.example .env.local
+test -f .env.local || cp .env.example .env.local
 ```
 
 Fill in your Sandbox credentials:
@@ -140,7 +140,20 @@ list.
 
 Notes and files stay in memory with each case while switching cases inside the
 live workspace. Reloading the page or switching to the demo studio clears those
-drafts. There is no database, server upload storage, or persistent draft saving.
+evidence drafts. Knowledge-base PDFs are stored separately in PostgreSQL and persist across reloads.
+
+### 4. Customize your knowledge base
+
+Open **Customize Your own knowledge base**, choose PDFs up to 50 MB each, and
+click **Upload documents**. Each PDF is stored as `pending`. Click **Start chunking**
+to queue indexing; the status becomes `running`, then `success` or `failed`.
+**Retry chunking** retries a failed document, and **Reindex** replaces an existing
+document's chunks. Only successful documents participate in **Search your knowledge**.
+
+Run the PostgreSQL migration and the separate worker before indexing. The full
+[knowledge-base guide](documents/knowledge-base.md) explains configuration, tables,
+CAS behavior, API endpoints, worker recovery, and tests. Existing `.env.local`
+files need the new fields from `.env.example` added without overwriting PayPal credentials.
 
 ## Evidence rules
 
@@ -229,8 +242,9 @@ Disputes client uses a fixed Sandbox host and never follows action links or
 performs dispute mutations.
 
 The API detail response retains operational fields for future backend work;
-the frontend chooses the customer support fields to display. There are no
-assessment, upload, execution, or appeal POST endpoints yet.
+the frontend chooses the customer support fields to display. Knowledge-base upload,
+indexing, and search POST endpoints are implemented separately. PayPal evidence
+submission, execution, and appeal endpoints remain planned integrations.
 
 | File | Responsibility |
 | --- | --- |
@@ -264,6 +278,9 @@ expose a Disputes controller.
 | `npm run dev` | Start the UI and API routes in development. |
 | `npm run lint` | Run ESLint. |
 | `npm run test:disputes` | Compile and run the mocked Disputes and evidence checks with Node's test runner. |
+| `npm run test:knowledge` | Test PostgreSQL/pgvector storage, CAS, worker recovery, and mocked provider contracts with PGlite. |
+| `npm run db:migrate` | Initialize the PostgreSQL knowledge-base schema and pgvector extension. |
+| `npm run worker:knowledge` | Run the durable indexing queue worker alongside the Next.js server. |
 | `npm run build` | Build the production application and check TypeScript. |
 | `npm run start` | Serve an existing production build. |
 

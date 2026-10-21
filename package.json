@@ -7,23 +7,32 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "db:migrate": "tsx scripts/knowledge-migrate.ts",
+    "worker:knowledge": "tsx scripts/knowledge-worker.ts",
+    "test:knowledge": "tsx --test tests/knowledge-base.test.ts",
     "pretest:disputes": "tsc tests/paypal-disputes.test.ts --outDir .next/dispute-tests --target ES2022 --module commonjs --moduleResolution node --esModuleInterop --strict --skipLibCheck --types node",
     "test:disputes": "node --test .next/dispute-tests/tests/paypal-disputes.test.js"
   },
   "dependencies": {
+    "@llamaindex/core": "^0.6.22",
     "@paypal/paypal-server-sdk": "^2.5.0",
     "next": "16.3.6",
+    "pg": "^8.23.1",
     "react": "19.2.8",
     "react-dom": "19.2.8"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.10",
+    "@electric-sql/pglite-pgvector": "^0.0.11",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
+    "@types/pg": "^8.23.1",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.3.6",
     "tailwindcss": "^4",
+    "tsx": "^4.23.15",
     "typescript": "^5"
   }
 }

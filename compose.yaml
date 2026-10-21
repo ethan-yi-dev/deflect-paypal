@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: deflect
+      POSTGRES_USER: deflect
+      POSTGRES_PASSWORD: anyword
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - knowledge_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deflect -d deflect"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  knowledge_postgres:
