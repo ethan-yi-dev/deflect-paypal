@@ -36,6 +36,13 @@ export function getProviderConfig(env: Record<string, string | undefined> = proc
   return { geminiKey, llamaKey, tier };
 }
 
+// Querying uses embeddings only; LlamaParse credentials are needed for PDF indexing.
+export function getEmbeddingConfig(env: Record<string, string | undefined> = process.env) {
+  const geminiKey = env.GEMINI_API_KEY?.trim();
+  if (!geminiKey || geminiKey === "anyword") throw new KnowledgeError("PROVIDER_NOT_CONFIGURED", "Set GEMINI_API_KEY in .env.local before searching the knowledge base.", 503);
+  return { geminiKey };
+}
+
 export function getRerankConfig(env: Record<string, string | undefined> = process.env) {
   const key = env.COHERE_API_KEY?.trim();
   const model = env.COHERE_RERANK_MODEL?.trim() || "rerank-v4.0-fast";

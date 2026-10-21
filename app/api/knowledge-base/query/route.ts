@@ -1,4 +1,4 @@
-import { assertBinding, getProviderConfig, getRerankConfig, KnowledgeError } from "@/lib/knowledge/config";
+import { assertBinding, getEmbeddingConfig, getRerankConfig, KnowledgeError } from "@/lib/knowledge/config";
 import { createKnowledgeProviders } from "@/lib/knowledge/providers";
 import { createCohereReranker } from "@/lib/knowledge/reranker";
 import { retrieveKnowledge } from "@/lib/knowledge/retrieval";
@@ -26,7 +26,7 @@ export async function POST(request: Request) {
     const config = getRerankConfig();
     const result = await retrieveKnowledge({
       query: input.query.trim(), limit, signal: request.signal, repository, config,
-      providers: createKnowledgeProviders(binding, getProviderConfig()), reranker: createCohereReranker(config),
+      providers: createKnowledgeProviders(binding, getEmbeddingConfig()), reranker: createCohereReranker(config),
     });
     return Response.json(result, { headers: knowledgeHeaders });
   } catch (error) { return knowledgeErrorResponse(error); }

@@ -8,9 +8,9 @@ Built with Next.js, React, and TypeScript for the
 [PayPal AI Hackathon](https://paypalaihackathon.devpost.com).
 
 > **Current scope:** dispute queries use the configured PayPal Sandbox account.
-> Deflect assessment runs local evidence rules. PayPal submission is a local
-> preview. LLM recommendations, Policy/JEV validation, and real dispute actions
-> are planned integrations.
+> Deflect assessment combines case data, uploaded evidence and policy retrieval
+> through OpenAI. PayPal submission remains a local preview. Policy/JEV validation
+> and real dispute actions are planned integrations.
 
 ## Current features
 
@@ -20,8 +20,8 @@ Built with Next.js, React, and TypeScript for the
 | Case selection | Opens the latest updated case by default; supports clicking another case, loading a known ID, and refreshing the list. |
 | Support details | Shows the initiator, conversation, dates, response deadline, amounts, related items, and requested evidence. |
 | Evidence preparation | Displays fields according to the dispute reason and the evidence requested from the seller. |
-| File selection | Validates local files, lists names and sizes, supports removal, and keeps drafts separate by case. |
-| Deflect assessment | Checks draft completeness and returns a rule-based suggestion about missing evidence or review steps. |
+| File selection | Validates PDF/image evidence, supports removal, and keeps drafts separate by case even when PayPal submission is unavailable. |
+| Deflect assessment | Combines a fresh case snapshot, actual attachments and top K policy passages into a cited assessment, recommendation, evidence checklist and response draft. Marks earlier results for reassessment after edits. |
 | PayPal submission | Opens a review preview when the case offers evidence submission; sends no evidence or action requests. |
 | Demo studio | Offers three fixed scenarios with predefined recommendations, Policy/JEV results, and a simulated audit trail. |
 | RAG knowledge base | Stores and versions PDF/text sources, indexes them asynchronously, and retrieves evidence with pgvector and Cohere reranking. Includes SHA-256 change detection, soft deletion, and worker recovery. See [RAG pipeline](#rag-pipeline-and-knowledge-base). |
@@ -66,6 +66,8 @@ Fill in your Sandbox credentials:
 ```dotenv
 PAYPAL_CLIENT_ID=your_sandbox_client_id
 PAYPAL_SECRET=your_sandbox_secret
+OPENAI_API_KEY=your_openai_api_key
+OPENAI_ASSESSMENT_MODEL=gpt-5.4-mini
 ```
 
 These values are read on the server. Keep them without a `NEXT_PUBLIC_` prefix.
@@ -123,12 +125,15 @@ In **Evidence & next steps**:
 
 1. Review the evidence labeled **Requested by PayPal**. Fill the relevant carrier,
    tracking, refund reference, or note fields.
-2. When **Submission available** is shown, choose files in **Add evidence files**.
-   The list shows each file's name, size, and **Not uploaded** status. Remove any
+2. Choose files in **Add evidence files**, including when submission is unavailable.
+   The list shows each file's name, size, and **Not sent to PayPal** status. Remove any
    file you do not want to include.
-3. Click **Run Deflect assessment** to check the draft and see what to collect or
-   review next. Editing the draft clears the previous result. Switching or
-   refreshing cases also requires running the assessment again.
+3. Click **Run Deflect assessment** to send the notes and actual files to OpenAI,
+   together with a fresh PayPal case and up to 6 relevant policy passages by default.
+   Review the cited assessment, recommendation, evidence gaps and response draft.
+   Edits mark the previous result for reassessment. See the
+   [workspace assessment guide](documents/workspace-assessment.md) for configuration,
+   source handling, limits and the API contract.
 4. Click **Submit evidence to PayPal** to review the local submission preview.
    **Confirm preview** is enabled only when a seller request is present and the
    required draft fields pass the basic check. Confirmation displays a local
@@ -138,7 +143,7 @@ Files already returned by PayPal as seller-submitted documents appear separately
 under **Files already on PayPal**. Selecting a local file does not add it to that
 list.
 
-Notes and files stay in memory with each case while switching cases inside the
+Notes, files and the latest assessment stay in memory with each case while switching cases inside the
 live workspace. Reloading the page or switching to the demo studio clears those
 evidence drafts. Knowledge-base documents are stored separately in PostgreSQL and persist across reloads.
 
@@ -149,12 +154,146 @@ existing sources, and search indexed content. The same knowledge base is availab
 from the live workspace and demo studio. Follow the dedicated [RAG setup and
 pipeline guide below](#rag-pipeline-and-knowledge-base) before indexing.
 
+## Workspace assessment logic
+
+**Run Deflect assessment** answers two questions: what does the available material
+support (**Assessment**), and what should the merchant do next (**Recommendation**)?
+The live workspace combines a fresh dispute snapshot, merchant-provided evidence,
+and retrieved policy passages in one structured OpenAI request. The fixed demo
+studio continues to use predefined scenarios.
+
+### Inputs and source attribution
+
+| Input | Included material | Source references |
+| --- | --- | --- |
+| PayPal dispute | Reason, status, stage, amounts, deadlines, transactions, messages, tracking references, requested evidence, and currently available response options. | `C-*` |
+| Merchant input | Evidence notes, carrier, tracking number, and existing refund reference entered in the workspace. | `M-*` |
+| Uploaded evidence | Actual PDF/image contents, associated evidence type, and filename. | `E-*` |
+| Retrieved policies | Relevant passage text, document name, page number, document ID, and chunk ID. | `P-*` |
+
+Each source also carries an authority label. For example, a buyer message returned
+by PayPal has a `C-*` reference but remains a **buyer statement**; it is not a
+verified transaction fact. Merchant-entered tracking and refund references remain
+merchant statements until supported by records. Previously submitted PayPal
+documents are metadata-only unless their contents are separately provided.
+
+### From case to recommendation
+
+```mermaid
+flowchart TD
+    run["Run Deflect assessment"] --> validate["Validate configuration and evidence upload"]
+    validate --> case["Reload dispute from PayPal Sandbox"]
+    case --> query["Build query from dispute reason, buyer claim and merchant input"]
+    query --> search["Gemini query embedding + pgvector: up to 50 candidates"]
+    search --> rerank["Cohere rerank, or vector order with a warning"]
+    rerank --> policies["Recheck source eligibility and take top K: default 6"]
+    case --> context["Assemble attributed case context"]
+    evidence["Merchant notes + actual PDF/image evidence"] --> context
+    policies --> context
+    context --> model["One OpenAI Responses request with strict JSON schema"]
+    model --> checks["Validate fields, citation IDs and allowed action"]
+    checks --> review["Assessment, recommendation, evidence checklist and response draft"]
+```
+
+1. **Read the current case.** The browser posts evidence groups and attachments to
+   `POST /api/disputes/{id}/assessment`. The backend checks the request origin,
+   dispute ID, configuration, upload size, field lengths, file associations and
+   file formats. It reloads the dispute using server-side PayPal credentials;
+   browser-supplied case facts are not used as the authoritative case snapshot.
+2. **Retrieve relevant policies.** A template combines the dispute reason and
+   stage, buyer statements, requested seller evidence, and merchant notes into a
+   query of at most 2,000 characters. Gemini embeds that query, pgvector retrieves
+   up to 50 candidates by default, and Cohere reranks the candidates when
+   configured. The backend rechecks exact chunk IDs for source eligibility before
+   taking the final top K, which defaults to 6 for workspace assessments.
+3. **Assemble all case evidence.** Top K limits policy passages; it does not filter
+   out this case's uploaded evidence. PDFs are sent as base64 `input_file` parts
+   and images as base64 `input_image` parts. Each attachment is associated with an
+   evidence source ID. Workspace evidence goes directly into the model request
+   and is not indexed into the shared policy knowledge base. LlamaParse remains
+   part of policy PDF indexing, rather than this evidence-reading step.
+4. **Generate a structured analysis.** One OpenAI request includes the attributed
+   sources, attachments, allowed actions, assessment time and retrieval warnings.
+   The instructions ask the model to distinguish records from claims, explain
+   contradictions and missing information, cite supporting material, and identify
+   relevant policies without assuming merchant terms determine PayPal's decision.
+   The prompt treats source text and embedded document instructions as data. Findings
+   and factual draft paragraphs must reference supplied source IDs. The current
+   prompt requests concise English output.
+5. **Validate and display the result.** Backend validation checks the response
+   shape and field limits, rejects unknown source IDs or duplicate IDs within a
+   citation list, requires policy findings to include a policy source, and restricts the recommended
+   action to the case's available actions plus internal evidence-gathering/manual
+   review steps. The workspace shows the result with clickable source references
+   and a copyable response draft for merchant review.
+
+### Assessment and recommendation output
+
+| Output | What the merchant sees |
+| --- | --- |
+| Case understanding | Summary, buyer's claim, and supported facts with source references. |
+| Evidence assessment | Supporting evidence, conflicting or unfavorable evidence, applicable policies, and stated uncertainties. |
+| Evidence checklist | Missing materials, why they matter, and high/medium/low priority. |
+| Recommendation | One next-step action, its rationale, and new information that could change it. |
+| Response draft | Sourced paragraphs for merchant review; the draft can be empty when a supported response cannot be prepared. |
+| Traceability | Source text, policy page/chunk references, retrieval query/status, model, timestamp, case update time, and an input snapshot hash. |
+
+For example, if the buyer reports non-delivery and the merchant supplies only a
+tracking number, the analysis should identify delivery as unconfirmed and request
+carrier delivery records before asserting that the item arrived. A later document
+may support delivery or reveal an address mismatch; reassessment should reflect
+its contents rather than automatically strengthen the case because a file was
+added. Retrieval scores are relevance signals, not win probabilities.
+
+### Reassessment, fallbacks and current limits
+
+Editing notes, tracking details or attachments marks the earlier result
+**Needs reassessment**. A refreshed case that differs from the assessed snapshot
+also requires reassessment. **Reassess case** reloads the case and repeats retrieval
+and analysis using the current inputs. Drafts and the latest assessment remain
+separate per case in page-session memory; a new assessment replaces the previous
+result. Reloading the page or leaving the live workspace clears them. Durable
+evidence storage and assessment history are still planned.
+
+If Cohere is unconfigured or unavailable, retrieval keeps vector ordering and
+returns a warning. If policy retrieval fails or returns no passages, the model can
+still assess the case and uploaded evidence, with the missing policy grounding
+shown as a limitation. OpenAI errors, incomplete responses, refusals and invalid
+outputs produce an error that the merchant can retry. PayPal evidence submission
+availability does not prevent uploading materials for analysis.
+
+Up to 12 PDF/JPEG/PNG/static GIF files are accepted per assessment, each strictly
+below 10 MB and collectively at most 50 MB. The textual source context is bounded;
+oversized contexts are rejected rather than silently dropping evidence. Policy
+authority, effective dates and geographic applicability are assessed from the
+available passage content; the knowledge schema does not establish these facts.
+Validation confirms that citation IDs exist, but does not prove that the cited
+source supports every generated claim. Merchant review remains necessary, and
+assessment does not execute a PayPal action or refund.
+
+### Assessment configuration
+
+Merge these server-side settings from [.env.example](.env.example) into your
+existing `.env.local`, replace the API-key placeholder, and restart the server.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | `anyword` placeholder | Required for assessment; missing/placeholder keys are rejected before provider calls. |
+| `OPENAI_ASSESSMENT_MODEL` | `gpt-5.4-mini` | Model used for the structured case analysis and evidence reading. |
+| `OPENAI_ASSESSMENT_TIMEOUT_MS` | `120000` | OpenAI request timeout in milliseconds. |
+| `ASSESSMENT_TOP_K` | `6` | Final number of policy passages supplied to the model; accepts 1–20. |
+
+The model must support the request's image/PDF inputs and Structured Outputs.
+Existing knowledge-base settings control the database, embedding model, candidate
+count and Cohere reranking. See the [workspace assessment guide](documents/workspace-assessment.md)
+for the multipart request contract, source handling and provider details.
+
 ## RAG pipeline and knowledge base
 
 Deflect implements the document ingestion, indexing, retrieval, and reranking
-stages of RAG. The current search returns evidence chunks with document names,
-page citations, and relevance scores. Generating an LLM answer from that evidence
-and using it in dispute assessments are planned integrations.
+stages of RAG. Standalone search returns chunks with document names, page citations,
+and relevance scores. The live workspace uses the same retrieval pipeline to ground
+OpenAI case assessments in policy sources.
 The current application uses one configured knowledge base and has no per-user
 knowledge-base access controls.
 
@@ -408,6 +547,7 @@ never fall back to the demo fixtures. Demo state resets when leaving the studio.
 
 ```text
 Browser → Next.js /api/disputes → PayPal Sandbox Disputes REST API
+        → Next.js /api/disputes/{id}/assessment → Policy retrieval + OpenAI
         → Local evidence rules and submission preview
 ```
 
@@ -415,6 +555,7 @@ Browser → Next.js /api/disputes → PayPal Sandbox Disputes REST API
 | --- | --- |
 | `GET /api/disputes` | `items`, `fetchedAt`, and `environment: sandbox`; first list page only. |
 | `GET /api/disputes/{id}` | Normalized `dispute` details, `fetchedAt`, and `environment: sandbox`. |
+| `POST /api/disputes/{id}/assessment` | Cited assessment and recommendation, source snapshot, retrieval diagnostics, warnings and model metadata. |
 
 The Disputes client obtains and caches an OAuth token, shares concurrent token
 requests, and retries a GET once after a rejected token. IDs are validated before
@@ -433,6 +574,8 @@ planned integrations.
 | --- | --- |
 | [app/live-dispute-workspace.tsx](app/live-dispute-workspace.tsx) | Live case list, customer context, selection, and case drafts. |
 | [app/dispute-evidence.tsx](app/dispute-evidence.tsx) | Evidence fields, local file lists, assessment results, and submission preview. |
+| [app/case-assessment.tsx](app/case-assessment.tsx) | Assessment findings, recommendation, cited draft, source navigation and reassessment status. |
+| [lib/assessment/](lib/assessment/) | Bounded uploads, case context, policy search query, OpenAI request and structured output validation. |
 | [lib/dispute-evidence.ts](lib/dispute-evidence.ts) | Baseline evidence rules, draft checks, and file validation. |
 | [lib/disputes.ts](lib/disputes.ts) | Shared types and normalization of PayPal responses. |
 | [lib/paypal-disputes.ts](lib/paypal-disputes.ts) | Server-only facade and sanitized API error responses. |
@@ -445,6 +588,7 @@ planned integrations.
 | [tests/paypal-disputes.test.ts](tests/paypal-disputes.test.ts) | Mocked API client, normalization, evidence, and file checks. |
 | [tests/knowledge-base.test.ts](tests/knowledge-base.test.ts) | PostgreSQL/pgvector storage, document lifecycle, CAS, worker recovery, and retrieval eligibility tests. |
 | [tests/knowledge-rerank.test.ts](tests/knowledge-rerank.test.ts) | Rerank API contract, result mapping, fallback, timeout, and cancellation checks. |
+| [tests/case-assessment.test.ts](tests/case-assessment.test.ts) | Assessment input limits, actual attachment transmission, source integrity, action availability and provider failure handling. |
 
 The original SDK pages remain available:
 
@@ -468,6 +612,7 @@ expose a Disputes controller.
 | `npm run lint` | Run ESLint. |
 | `npm run test:disputes` | Compile and run the mocked Disputes and evidence checks with Node's test runner. |
 | `npm run test:knowledge` | Test PostgreSQL/pgvector storage, document lifecycle, worker recovery, and retrieval/reranking with mocked providers. |
+| `npm run test:assessment` | Test assessment uploads, source context, OpenAI contract, citations, fallback and cancellation with mocked providers. |
 | `npm run db:migrate` | Initialize the PostgreSQL knowledge-base schema and pgvector extension. |
 | `npm run worker:knowledge` | Run the durable indexing queue worker alongside the Next.js server. |
 | `npm run build` | Build the production application and check TypeScript. |
@@ -488,7 +633,9 @@ Next.js build both write generated files under `.next`.
 | PayPal is not configured | Fill both values in `.env.local` and restart the dev server. |
 | Authentication or access error | Check the Sandbox credentials and the app/merchant's Disputes access. |
 | No cases listed | Confirm the configured merchant account; load a known dispute ID directly if needed. Only the first list page is queried. |
-| File selection or submission is unavailable | The current detail response has no applicable POST evidence link. |
+| PayPal submission is unavailable | The current detail response has no applicable POST evidence link. Files can still be added for analysis. |
+| OpenAI is not configured | Replace `OPENAI_API_KEY=anyword` in `.env.local` with a real key and restart the app. |
+| Assessment has no policy grounding | Check the visible retrieval warning, indexed documents, database and Gemini configuration. |
 | Assessment requests more evidence | Follow the missing-field suggestions; refund and tracking evidence need their structured references where required. |
 | Preview confirmation is disabled | A specific seller request and complete draft fields are required. |
 | Files disappeared | Drafts are in-memory and reset on reload or when leaving the live workspace. |
@@ -507,9 +654,9 @@ Read dispute → Query order and carrier facts → LLM recommendation
              → Policy / JEV validation → Execute action → Persist audit log
 ```
 
-The current implementation covers dispute reads, evidence preparation, and local
-rule checks. Remaining work includes order/carrier queries, LLM integration,
-Policy/JEV validation, actual PayPal evidence submission or other actions,
+The current implementation covers dispute reads, evidence preparation, local rule
+checks and cited OpenAI assessments using policy retrieval. Remaining work includes
+order/carrier queries, Policy/JEV validation, actual PayPal evidence submission or other actions,
 persistent drafts and audit logs, pagination, and application authentication.
 
 ## Origin and attribution

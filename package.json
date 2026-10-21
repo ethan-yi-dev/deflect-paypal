@@ -10,6 +10,7 @@
     "db:migrate": "tsx scripts/knowledge-migrate.ts",
     "worker:knowledge": "tsx scripts/knowledge-worker.ts",
     "test:knowledge": "tsx --test tests/knowledge-base.test.ts tests/knowledge-rerank.test.ts",
+    "test:assessment": "tsx --test tests/case-assessment.test.ts",
     "pretest:disputes": "tsc tests/paypal-disputes.test.ts --outDir .next/dispute-tests --target ES2022 --module commonjs --moduleResolution node --esModuleInterop --strict --skipLibCheck --types node",
     "test:disputes": "node --test .next/dispute-tests/tests/paypal-disputes.test.js"
   },

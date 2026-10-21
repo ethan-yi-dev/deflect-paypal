@@ -4,7 +4,8 @@ import { getProviderConfig, KnowledgeError } from "./config";
 import { validateVector } from "./repository";
 import type { ModelBinding, ParsedPage } from "./types";
 
-type ProviderConfig = ReturnType<typeof getProviderConfig>;
+type FullProviderConfig = ReturnType<typeof getProviderConfig>;
+type ProviderConfig = Pick<FullProviderConfig, "geminiKey"> & Partial<Pick<FullProviderConfig, "llamaKey" | "tier">>;
 export type KnowledgeProviders = {
   parse: (pdf: Uint8Array, name: string, signal: AbortSignal) => Promise<ParsedPage[]>;
   embed: (text: string, purpose: "document" | "query", title: string, signal: AbortSignal) => Promise<number[]>;
@@ -30,6 +31,7 @@ export function createKnowledgeProviders(binding: ModelBinding, config: Provider
 
   return {
     async parse(pdf, name, signal) {
+      if (!config.llamaKey || config.llamaKey === "anyword") throw new KnowledgeError("PROVIDER_NOT_CONFIGURED", "Set LLAMA_CLOUD_API_KEY before parsing PDFs.", 503);
       const parseSignal = AbortSignal.any([signal, AbortSignal.timeout(15 * 60 * 1000)]);
       const headers = { Authorization: `Bearer ${config.llamaKey}`, Accept: "application/json" };
       const form = new FormData();
@@ -39,7 +41,7 @@ export function createKnowledgeProviders(binding: ModelBinding, config: Provider
       if (typeof file.id !== "string" || !file.id) throw new KnowledgeError("INVALID_PARSE_RESPONSE", "LlamaParse did not return a file ID.", 502);
       const job = await request<{ id: string }>("https://api.cloud.llamaindex.ai/api/v2/parse", {
         method: "POST", headers: { ...headers, "Content-Type": "application/json" },
-        body: JSON.stringify({ file_id: file.id, tier: config.tier, version: "latest" }),
+        body: JSON.stringify({ file_id: file.id, tier: config.tier || "agentic", version: "latest" }),
       }, parseSignal, "LlamaParse");
       if (typeof job.id !== "string" || !job.id) throw new KnowledgeError("INVALID_PARSE_RESPONSE", "LlamaParse did not return a job ID.", 502);
       while (true) {

@@ -46,7 +46,9 @@ Open **Customize Your own knowledge base**. Upload PDF/TXT/MD files or select
 and Google for embeddings; saving a source does not invoke paid providers.
 Click a document name to download its
 stored original. **Search your knowledge** returns matching chunks and page
-citations; it does not generate an LLM answer or change dispute recommendations.
+citations; standalone search does not generate an LLM answer. Live workspace
+assessments reuse the retrieval pipeline to provide cited recommendations; see
+[workspace assessment](workspace-assessment.md).
 Search first retrieves vector candidates, then uses Cohere to rerank them when
 `COHERE_API_KEY` is configured. No embedding rebuild is required to enable reranking.
 
