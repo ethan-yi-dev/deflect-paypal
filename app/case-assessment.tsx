@@ -66,6 +66,6 @@ export default function CaseAssessmentView({ result, stale, caseId }: { result: 
     {!!draft && <section className={styles.assessmentDraft}><div className={styles.blockHeading}><span><Icon name="message" size={16} />Response draft</span><button type="button" className={styles.secondaryButton} onClick={copyDraft} disabled={stale}>Copy draft</button></div>{assessment.recommendation.responseDraft.map((item, index) => <Statement key={index} statement={item} prefix={prefix} />)}<p className={styles.evidenceHint}>Review the facts and wording before using this draft.</p>{copyNotice && <p role="status">{copyNotice}</p>}</section>}
     <details className={styles.assessmentSources} open><summary>Sources · {result.sources.length} references</summary>{result.sources.map((source) => <Source key={source.id} source={source} prefix={prefix} />)}</details>
     <details className={styles.assessmentDiagnostics}><summary>Assessment details</summary><p>Model: {result.model}</p><p>Policy passages: {result.retrieval.hitCount} / {result.retrieval.limit} · {result.retrieval.details?.rerankStatus ?? result.retrieval.status}</p><p>Snapshot: {result.snapshotHash}</p><pre>{result.retrieval.query}</pre></details>
-    <p className={styles.evidenceHint}>AI-generated guidance for merchant review. No response, evidence or refund has been sent.</p>
+    <p className={styles.evidenceHint}>AI-generated guidance for merchant review. Sending evidence requires the separate PayPal confirmation step.</p>
   </div>;
 }

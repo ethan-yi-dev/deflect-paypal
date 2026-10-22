@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { assertBinding, KnowledgeError } from "./config";
 import type { Database, Sql } from "./database";
 import { prepareFile, type DocumentSource } from "./document-source";
-import type { KnowledgeChunk, KnowledgeContentType, KnowledgeDeleteResult, KnowledgeDocument, KnowledgeStatus, KnowledgeWriteResult, ModelBinding, SearchHit } from "./types";
+import type { ActiveProcessing, KnowledgeChunk, KnowledgeContentType, KnowledgeDeleteResult, KnowledgeDocument, KnowledgeList, KnowledgeStatus, KnowledgeWriteResult, ModelBinding, ProcessingStage, SearchHit } from "./types";
 
 type DocumentRow = {
   id: string; name: string; size: number; status: KnowledgeStatus; embedding_model: string;
@@ -18,7 +18,7 @@ function documentDto(row: DocumentRow): KnowledgeDocument {
     uploadedAt: new Date(row.created_at).toISOString(), indexedAt: row.indexed_at ? new Date(row.indexed_at).toISOString() : null,
   };
 }
-export type ClaimedJob = { id: string; docId: string };
+export type ProcessingRun = { id: string; docId: string };
 
 export function validateVector(vector: number[], dimensions: number) {
   if (vector.length !== dimensions || vector.some((value) => !Number.isFinite(value)) || !vector.some((value) => value !== 0)) {
@@ -37,10 +37,22 @@ export class KnowledgeRepository {
     return b;
   }
 
-  async list() {
+  async list(): Promise<KnowledgeList> {
     const knowledgeBase = await this.ensureBase();
+    await this.recoverExpiredJobs();
     const rows = await this.db.query<DocumentRow>(`SELECT ${documentColumns} FROM t_knowledge_document WHERE knowledge_base_id=$1 AND deleted_at IS NULL ORDER BY created_at DESC, id`, [knowledgeBase.id]);
-    return { knowledgeBase, documents: rows.map(documentDto) };
+    // Include a removed document's active attempt until it settles or expires.
+    const [activeProcessing] = await this.db.query<ActiveProcessing>(`SELECT d.id AS "documentId", d.name AS "documentName",
+      j.stage, j.completed_chunks AS "completedChunks", j.total_chunks AS "totalChunks"
+      FROM t_knowledge_job j JOIN t_knowledge_document d ON d.id=j.doc_id
+      WHERE d.knowledge_base_id=$1 AND j.state='working' ORDER BY j.created_at LIMIT 1`, [knowledgeBase.id]);
+    return { knowledgeBase, documents: rows.map(documentDto), activeProcessing: activeProcessing ?? null };
+  }
+
+  async document(docId: string) {
+    const [row] = await this.db.query<DocumentRow>(`SELECT ${documentColumns} FROM t_knowledge_document WHERE id=$1 AND knowledge_base_id=$2 AND deleted_at IS NULL`, [docId, this.binding.id]);
+    if (!row) throw new KnowledgeError("DOCUMENT_NOT_FOUND", "Document not found.", 404);
+    return documentDto(row);
   }
 
   async upload(name: string, pdf: Uint8Array) {
@@ -78,7 +90,7 @@ export class KnowledgeRepository {
         chunk_count=0, indexed_at=NULL, error_message=NULL, updated_at=now(), name=$8
         WHERE id=$1 AND knowledge_base_id=$2 RETURNING ${documentColumns}`,
       [docId, b.id, source.size, source.pdf, source.text, source.contentType, source.hash, source.name]);
-      return { document: documentDto(row), changed: true, operation: "updated", message: "Document updated. Old vectors were removed. Start chunking to rebuild the index." };
+      return { document: documentDto(row), changed: true, operation: "updated", message: "Document updated. Old vectors were removed. Click Process document to rebuild the index." };
     });
   }
 
@@ -90,9 +102,20 @@ export class KnowledgeRepository {
     return { id: row.id, deletedAt: new Date(row.deleted_at).toISOString(), message: "Document removed from the knowledge base. Its source, chunks, and vectors are retained and excluded from search." };
   }
 
-  async startIndexing(docId: string) {
+  async startProcessing(docId: string) {
+    await this.ensureBase();
+    await this.recoverExpiredJobs();
     return this.db.transaction(async (sql) => {
       const b = await this.ensureBase(sql);
+      // Serialize admission across documents, browser tabs, and server instances.
+      // This short transaction ends before any external provider is called.
+      await sql("SELECT id FROM t_knowledge_base WHERE id=$1 FOR UPDATE", [b.id]);
+      const [existing] = await sql<DocumentRow>(`SELECT ${documentColumns} FROM t_knowledge_document WHERE id=$1 AND knowledge_base_id=$2 AND deleted_at IS NULL FOR UPDATE`, [docId, b.id]);
+      if (!existing) throw new KnowledgeError("DOCUMENT_NOT_FOUND", "Document not found.", 404);
+      if (existing.status === "running") throw new KnowledgeError("ALREADY_RUNNING", "This document is already processing. Wait for it to succeed or fail.", 409);
+      const active = await sql(`SELECT j.id FROM t_knowledge_job j JOIN t_knowledge_document d ON d.id=j.doc_id
+        WHERE d.knowledge_base_id=$1 AND j.state='working' LIMIT 1`, [b.id]);
+      if (active.length) throw new KnowledgeError("PROCESSING_BUSY", "Another document is processing. Wait for it to succeed or fail before starting this document.", 409);
       const runId = randomUUID();
       // Atomic CAS: concurrent requests recheck this predicate after row-lock waits.
       const [row] = await sql<DocumentRow>(`UPDATE t_knowledge_document SET status='running', active_run_id=$3,
@@ -103,50 +126,49 @@ export class KnowledgeRepository {
         const existing = await sql("SELECT id FROM t_knowledge_document WHERE id=$1 AND knowledge_base_id=$2 AND deleted_at IS NULL", [docId, b.id]);
         throw new KnowledgeError(existing.length ? "ALREADY_RUNNING" : "DOCUMENT_NOT_FOUND", existing.length ? "This document is already running. Wait for it to finish." : "Document not found.", existing.length ? 409 : 404);
       }
-      // Status and durable job are committed together; no fire-and-forget request task.
+      // The selected document starts immediately; nothing is queued for later.
       await sql("DELETE FROM t_knowledge_chunk WHERE doc_id=$1", [docId]);
-      await sql("INSERT INTO t_knowledge_job (id, doc_id, source_hash) VALUES ($1,$2,$3)", [runId, docId, row.content_hash]);
-      return documentDto(row);
+      await sql(`INSERT INTO t_knowledge_job (id, doc_id, source_hash, state, lease_until, stage)
+        VALUES ($1,$2,$3,'working',now() + interval '2 minutes','load')`, [runId, docId, row.content_hash]);
+      return { document: documentDto(row), run: { id: runId, docId } };
     });
   }
 
-  async claimJob(): Promise<ClaimedJob | null> {
-    // Claim removed documents' queued jobs too: loadJobDocument rejects them
-    // before any provider call, and the worker settles them as failed.
-    const [job] = await this.db.query<{ id: string; doc_id: string }>(`WITH next_job AS (
-      SELECT j.id FROM t_knowledge_job j JOIN t_knowledge_document d ON d.id=j.doc_id
-      WHERE j.state='queued' AND d.knowledge_base_id=$1 ORDER BY j.created_at
-      FOR UPDATE OF j SKIP LOCKED LIMIT 1
-    ) UPDATE t_knowledge_job j SET state='working', lease_until=now() + interval '2 minutes'
-      FROM next_job WHERE j.id=next_job.id RETURNING j.id, j.doc_id`, [this.binding.id]);
-    return job ? { id: job.id, docId: job.doc_id } : null;
+  async updateProgress(job: ProcessingRun, stage: ProcessingStage, completedChunks = 0, totalChunks = 0) {
+    const rows = await this.db.query(`UPDATE t_knowledge_job j SET stage=$3, completed_chunks=$4, total_chunks=$5
+      WHERE j.id=$1 AND j.doc_id=$2 AND j.state='working' AND j.lease_until > now()
+      AND EXISTS (SELECT 1 FROM t_knowledge_document d WHERE d.id=j.doc_id AND d.active_run_id=j.id
+        AND d.knowledge_base_id=$6 AND d.deleted_at IS NULL AND d.content_hash=j.source_hash)
+      RETURNING j.id`, [job.id, job.docId, stage, completedChunks, totalChunks, this.binding.id]);
+    if (!rows.length) throw new KnowledgeError("STALE_JOB", "This processing attempt is no longer active.", 409);
   }
 
-  async renewLease(job: ClaimedJob) {
+  async renewLease(job: ProcessingRun) {
     const rows = await this.db.query(`UPDATE t_knowledge_job SET lease_until=now() + interval '2 minutes'
       WHERE id=$1 AND state='working' AND lease_until > now()
       AND EXISTS (SELECT 1 FROM t_knowledge_document d WHERE d.id=t_knowledge_job.doc_id AND d.deleted_at IS NULL)
       RETURNING id`, [job.id]);
-    if (!rows.length) throw new KnowledgeError("JOB_LEASE_LOST", "The worker lease expired. Retry indexing.", 409);
+    if (!rows.length) throw new KnowledgeError("JOB_LEASE_LOST", "The processing request stopped or expired. Retry processing.", 409);
   }
 
-  async loadJobDocument(job: ClaimedJob) {
+  async loadJobDocument(job: ProcessingRun) {
     await this.ensureBase();
     const [row] = await this.db.query<{ name: string; pdf_data: Uint8Array | null; text_content: string | null; content_type: KnowledgeContentType; embedding_model: string; embedding_dimensions: number }>(`SELECT d.name, d.pdf_data, d.text_content, d.content_type, d.embedding_model, d.embedding_dimensions FROM t_knowledge_document d JOIN t_knowledge_job j ON j.id=d.active_run_id
-      WHERE d.id=$1 AND d.active_run_id=$2 AND d.status='running' AND d.deleted_at IS NULL AND d.knowledge_base_id=$3 AND j.source_hash=d.content_hash`, [job.docId, job.id, this.binding.id]);
+      WHERE d.id=$1 AND d.active_run_id=$2 AND d.status='running' AND d.deleted_at IS NULL AND d.knowledge_base_id=$3 AND j.source_hash=d.content_hash
+      AND j.state='working' AND j.lease_until > now()`, [job.docId, job.id, this.binding.id]);
     if (!row) throw new KnowledgeError("STALE_JOB", "This indexing attempt is no longer active.", 409);
     assertBinding({ id: this.binding.id, embeddingModel: row.embedding_model, embeddingDimensions: row.embedding_dimensions }, this.binding);
     return { name: row.name, pdf: row.pdf_data, text: row.text_content, contentType: row.content_type };
   }
 
-  async completeJob(job: ClaimedJob, chunks: KnowledgeChunk[]) {
-    if (!chunks.length) throw new KnowledgeError("EMPTY_DOCUMENT", "No searchable text was found in this PDF.", 422);
+  async completeJob(job: ProcessingRun, chunks: KnowledgeChunk[]) {
+    if (!chunks.length) throw new KnowledgeError("EMPTY_DOCUMENT", "No searchable text was found in this document.", 422);
     for (const chunk of chunks) validateVector(chunk.embedding, this.binding.embeddingDimensions);
     await this.db.transaction(async (sql) => {
       const b = await this.ensureBase(sql);
       const [lease] = await sql<{ source_hash: string }>("SELECT source_hash FROM t_knowledge_job WHERE id=$1 AND state='working' AND lease_until > now() FOR UPDATE", [job.id]);
       const active = await sql("SELECT id FROM t_knowledge_document WHERE id=$1 AND active_run_id=$2 AND status='running' AND deleted_at IS NULL AND knowledge_base_id=$3 AND content_hash=$4 FOR UPDATE", [job.docId, job.id, b.id, lease?.source_hash ?? ""]);
-      if (!lease || !active.length) throw new KnowledgeError("STALE_JOB", "A stale worker cannot overwrite this document.", 409);
+      if (!lease || !active.length) throw new KnowledgeError("STALE_JOB", "A stale processing request cannot overwrite this document.", 409);
       await sql("DELETE FROM t_knowledge_chunk WHERE doc_id=$1", [job.docId]);
       for (const [index, chunk] of chunks.entries()) {
         await sql(`INSERT INTO t_knowledge_chunk (id, doc_id, knowledge_base_id, chunk_index, content, page_number, embedding_model, embedding_dimensions, embedding)
@@ -154,11 +176,11 @@ export class KnowledgeRepository {
         [randomUUID(), job.docId, b.id, index, chunk.text, chunk.pageNumber, b.embeddingModel, b.embeddingDimensions, JSON.stringify(chunk.embedding)]);
       }
       await sql("UPDATE t_knowledge_document SET status='success', active_run_id=NULL, chunk_count=$3, indexed_at=now(), updated_at=now(), error_message=NULL WHERE id=$1 AND active_run_id=$2", [job.docId, job.id, chunks.length]);
-      await sql("UPDATE t_knowledge_job SET state='done', lease_until=NULL, finished_at=now() WHERE id=$1", [job.id]);
+      await sql("UPDATE t_knowledge_job SET state='done', stage='store', completed_chunks=$2, total_chunks=$2, lease_until=NULL, finished_at=now() WHERE id=$1", [job.id, chunks.length]);
     });
   }
 
-  async failJob(job: ClaimedJob, message: string, failure?: { step: string; stack: string }) {
+  async failJob(job: ProcessingRun, message: string, failure?: { step: string; stack: string }) {
     await this.db.transaction(async (sql) => {
       const rows = await sql("UPDATE t_knowledge_job SET state='failed', lease_until=NULL, error_message=$2, failed_step=$3, error_stack=$4, finished_at=now() WHERE id=$1 AND state='working' RETURNING id", [job.id, message.slice(0, 1000), failure?.step ?? null, failure?.stack.slice(0, 8000) ?? null]);
       if (rows.length) await sql("UPDATE t_knowledge_document SET status='failed', active_run_id=NULL, error_message=$3, updated_at=now() WHERE id=$1 AND active_run_id=$2 AND status='running'", [job.docId, job.id, message.slice(0, 1000)]);
@@ -168,10 +190,11 @@ export class KnowledgeRepository {
   async recoverExpiredJobs() {
     await this.db.transaction(async (sql) => {
       const expired = await sql<{ id: string; doc_id: string }>(`SELECT j.id, j.doc_id FROM t_knowledge_job j JOIN t_knowledge_document d ON d.id=j.doc_id
-        WHERE j.state='working' AND j.lease_until <= now() AND d.knowledge_base_id=$1 FOR UPDATE OF j SKIP LOCKED`, [this.binding.id]);
+        WHERE d.knowledge_base_id=$1 AND (j.state='queued' OR (j.state='working' AND (j.lease_until <= now() OR j.stage IS NULL)))
+        FOR UPDATE OF j SKIP LOCKED`, [this.binding.id]);
       for (const job of expired) {
-        const message = "The indexing worker stopped or lost its lease. Retry indexing.";
-        await sql("UPDATE t_knowledge_job SET state='failed', lease_until=NULL, error_message=$2, failed_step='worker', finished_at=now() WHERE id=$1", [job.id, message]);
+        const message = "The processing request stopped or expired. Click Retry processing to start again.";
+        await sql("UPDATE t_knowledge_job SET state='failed', lease_until=NULL, error_message=$2, failed_step=COALESCE(stage, 'load'), finished_at=now() WHERE id=$1", [job.id, message]);
         await sql("UPDATE t_knowledge_document SET status='failed', active_run_id=NULL, error_message=$3, updated_at=now() WHERE id=$1 AND active_run_id=$2", [job.doc_id, job.id, message]);
       }
     });

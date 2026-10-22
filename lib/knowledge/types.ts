@@ -20,7 +20,15 @@ export type KnowledgeDocument = {
 };
 export type KnowledgeWriteResult = { document: KnowledgeDocument; changed: boolean; operation: "created" | "updated" | "unchanged"; message: string };
 export type KnowledgeDeleteResult = { id: string; deletedAt: string; message: string };
-export type KnowledgeList = { knowledgeBase: ModelBinding; documents: KnowledgeDocument[] };
+export type ProcessingStage = "load" | "parse" | "chunk" | "embed" | "store";
+export type ActiveProcessing = {
+  documentId: string;
+  documentName: string;
+  stage: ProcessingStage;
+  completedChunks: number;
+  totalChunks: number;
+};
+export type KnowledgeList = { knowledgeBase: ModelBinding; documents: KnowledgeDocument[]; activeProcessing: ActiveProcessing | null };
 export type ParsedPage = { pageNumber: number; text: string };
 export type KnowledgeChunk = ParsedPage & { embedding: number[] };
 // score remains the original cosine similarity for existing API consumers.

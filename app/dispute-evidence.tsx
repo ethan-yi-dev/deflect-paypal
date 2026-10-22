@@ -4,12 +4,13 @@ import { useEffect, useRef, useState, type ChangeEvent } from "react";
 import type { DisputeDetail } from "@/lib/disputes";
 import { assessEvidence, checkEvidence, EVIDENCE_FILE_ACCEPT, EVIDENCE_GUIDE_URL, evidenceTitle, FILE_GUIDE_URL, getEvidencePlan, validateEvidenceFiles, type EvidenceInput } from "@/lib/dispute-evidence";
 import { MAX_ASSESSMENT_FILES, type CaseAssessmentResult } from "@/lib/assessment/types";
+import type { EvidenceSubmissionPreview, EvidenceSubmissionResult } from "@/lib/paypal-evidence";
 import CaseAssessmentView from "./case-assessment";
 import { Badge, Icon } from "./workspace-ui";
 import styles from "./dispute-workspace.module.css";
 
 type EvidenceDraft = Omit<EvidenceInput, "files"> & { files: File[] };
-export type CaseEvidenceDraft = { inputs: Record<string, EvidenceDraft>; assessment?: CaseAssessmentResult; assessedInputs?: string; assessedCase?: string };
+export type CaseEvidenceDraft = { inputs: Record<string, EvidenceDraft>; assessment?: CaseAssessmentResult; assessedInputs?: string; assessedCase?: string; submission?: EvidenceSubmissionResult; submittedInputs?: string };
 export const EMPTY_CASE_EVIDENCE: CaseEvidenceDraft = { inputs: {} };
 const EMPTY_INPUT: EvidenceDraft = { notes: "", carrier: "", trackingNumber: "", refundReference: "", files: [] };
 
@@ -21,25 +22,44 @@ function inputSignature(inputs: Record<string, EvidenceDraft>) {
   return JSON.stringify(Object.entries(inputs).sort(([a], [b]) => a.localeCompare(b)).map(([type, input]) => ({ type, ...input, files: input.files.map(fileKey) })));
 }
 function caseSignature(dispute: DisputeDetail) { return JSON.stringify({ ...dispute, raw: undefined }); }
+function evidenceForm(inputs: Record<string, EvidenceDraft>) {
+  const form = new FormData();
+  let fileIndex = 0;
+  const groups = Object.entries(inputs).map(([type, input]) => ({ type, notes: input.notes, carrier: input.carrier, trackingNumber: input.trackingNumber, refundReference: input.refundReference,
+    fileKeys: input.files.map((file) => { const key = `file-${++fileIndex}`; form.append(key, file); return key; }) }));
+  form.set("inputs", JSON.stringify(groups));
+  return form;
+}
 
-export default function DisputeEvidence({ dispute, draft, onChange }: { dispute: DisputeDetail; draft: CaseEvidenceDraft; onChange: (draft: CaseEvidenceDraft) => void }) {
+export default function DisputeEvidence({ dispute, draft, onChange, onSubmitted }: { dispute: DisputeDetail; draft: CaseEvidenceDraft; onChange: (draft: CaseEvidenceDraft) => void; onSubmitted: (result: EvidenceSubmissionResult) => void }) {
   const plan = getEvidencePlan(dispute);
   const [fileErrors, setFileErrors] = useState<Record<string, string[]>>({});
   const [assessing, setAssessing] = useState(false);
   const [assessmentError, setAssessmentError] = useState("");
   const [submissionNotice, setSubmissionNotice] = useState("");
+  const [submissionError, setSubmissionError] = useState("");
+  const [review, setReview] = useState<EvidenceSubmissionPreview | null>(null);
+  const [reviewing, setReviewing] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const submitLock = useRef(false);
   const dialogRef = useRef<HTMLDialogElement>(null);
   const requestRef = useRef<AbortController | null>(null);
-  const preview = assessEvidence(plan, draft.inputs, dispute.canProvideEvidence);
+  const reviewRequestRef = useRef<AbortController | null>(null);
+  const canSubmitEvidence = dispute.canProvideEvidence && dispute.status === "WAITING_FOR_SELLER_RESPONSE";
+  const preview = assessEvidence(plan, draft.inputs, canSubmitEvidence);
   const allFiles = Object.values(draft.inputs).flatMap((input) => input.files);
   const stale = !!draft.assessment && (draft.assessedInputs !== inputSignature(draft.inputs) || draft.assessedCase !== caseSignature(dispute) || draft.assessment.caseUpdatedAt !== dispute.updatedAt);
-  useEffect(() => () => requestRef.current?.abort(), []);
+  const draftWasSubmitted = !!draft.submission && draft.submittedInputs === inputSignature(draft.inputs);
+  useEffect(() => () => { requestRef.current?.abort(); reviewRequestRef.current?.abort(); }, []);
 
   function updateInput(type: string, changes: Partial<EvidenceDraft>) {
+    if (submitLock.current) return;
     requestRef.current?.abort();
     requestRef.current = null;
     setAssessing(false);
     setAssessmentError("");
+    setReview(null);
+    reviewRequestRef.current?.abort();
     onChange({ ...draft, inputs: { ...draft.inputs, [type]: { ...(draft.inputs[type] ?? EMPTY_INPUT), ...changes } } });
     setSubmissionNotice("");
   }
@@ -69,12 +89,7 @@ export default function DisputeEvidence({ dispute, draft, onChange }: { dispute:
     setAssessmentError("");
     setSubmissionNotice("");
     try {
-      const form = new FormData();
-      let fileIndex = 0;
-      const inputs = Object.entries(draft.inputs).map(([type, input]) => ({ type, notes: input.notes, carrier: input.carrier, trackingNumber: input.trackingNumber, refundReference: input.refundReference,
-        fileKeys: input.files.map((file) => { const key = `file-${++fileIndex}`; form.append(key, file); return key; }) }));
-      form.set("inputs", JSON.stringify(inputs));
-      const response = await fetch(`/api/disputes/${encodeURIComponent(dispute.id)}/assessment`, { method: "POST", body: form, signal: controller.signal });
+      const response = await fetch(`/api/disputes/${encodeURIComponent(dispute.id)}/assessment`, { method: "POST", body: evidenceForm(draft.inputs), signal: controller.signal });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error?.message ?? "Unable to assess the case. Please retry.");
       if (!controller.signal.aborted) onChange({ ...draft, assessment: result as CaseAssessmentResult, assessedInputs: inputSignature(draft.inputs), assessedCase: caseSignature(dispute) });
@@ -85,18 +100,63 @@ export default function DisputeEvidence({ dispute, draft, onChange }: { dispute:
     }
   }
 
+  async function openSubmission() {
+    requestRef.current?.abort();
+    requestRef.current = null;
+    setAssessing(false);
+    reviewRequestRef.current?.abort();
+    const controller = new AbortController();
+    reviewRequestRef.current = controller;
+    setReview(null);
+    setSubmissionError("");
+    setReviewing(true);
+    dialogRef.current?.showModal();
+    try {
+      const response = await fetch(`/api/disputes/${encodeURIComponent(dispute.id)}/evidence`, { method: "POST", headers: { "X-Evidence-Mode": "preview" }, body: evidenceForm(draft.inputs), signal: controller.signal });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error?.message ?? "Unable to prepare the evidence submission.");
+      if (!controller.signal.aborted) setReview(result as EvidenceSubmissionPreview);
+    } catch (error) {
+      if (!controller.signal.aborted) setSubmissionError(error instanceof Error ? error.message : "Unable to prepare the evidence submission.");
+    } finally { if (reviewRequestRef.current === controller) setReviewing(false); }
+  }
+  function closeSubmission() {
+    if (submitLock.current) return;
+    reviewRequestRef.current?.abort();
+    dialogRef.current?.close();
+  }
+  async function confirmSubmission() {
+    if (!review || submitLock.current) return;
+    submitLock.current = true;
+    setSubmitting(true);
+    setSubmissionError("");
+    try {
+      const response = await fetch(`/api/disputes/${encodeURIComponent(dispute.id)}/evidence`, { method: "POST", headers: { "X-Evidence-Mode": "submit", "X-Evidence-Review": review.reviewToken }, body: evidenceForm(draft.inputs) });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error?.message ?? "PayPal evidence submission could not be confirmed. Verify the case before submitting again.");
+      const receipt = result as EvidenceSubmissionResult;
+      onChange({ ...draft, submission: receipt, submittedInputs: inputSignature(draft.inputs) });
+      onSubmitted(receipt);
+      setSubmissionNotice(receipt.refreshWarning ?? "PayPal Sandbox accepted your evidence. The case has been refreshed.");
+      dialogRef.current?.close();
+    } catch (error) {
+      setReview(null);
+      setSubmissionError(error instanceof Error ? error.message : "The submission result is uncertain. Check the case in PayPal before submitting again.");
+    } finally { submitLock.current = false; setSubmitting(false); }
+  }
+
   return <section id="evidence" className={`${styles.panel} ${styles.evidencePanel}`} aria-labelledby="evidence-title">
     <div className={`${styles.panelHeader} ${styles.evidencePanelHeader}`}>
       <div className={styles.evidenceHeading}>
         <span className={styles.evidenceActionIcon}><Icon name="arrow" size={22} /></span>
         <div><span className={styles.evidenceActionLabel}>ACTION WORKSPACE</span><h2 id="evidence-title"><span className={styles.sectionNumber}>03</span>Evidence &amp; next steps</h2><p>Prepare evidence, assess the case, and review the next step.</p></div>
       </div>
-      <Badge tone={dispute.canProvideEvidence ? "green" : "neutral"}>{dispute.canProvideEvidence ? "Submission available" : "Submission unavailable"}</Badge>
+      <Badge tone={canSubmitEvidence ? "green" : "neutral"}>{canSubmitEvidence ? "Submission available" : "Submission unavailable"}</Badge>
     </div>
     <div className={styles.panelBody}>
       <div className={styles.evidenceIntroduction}><div><strong>{plan.title}</strong><p>{plan.context}</p><p>{plan.hasSellerRequest ? "Prepare the evidence PayPal has requested from your store below." : "No specific seller request was returned. These are reference options; confirm which evidence applies before submitting."}</p></div><a href={EVIDENCE_GUIDE_URL} target="_blank" rel="noreferrer">PayPal evidence guide<Icon name="arrow" size={13} /></a></div>
       <div className={styles.evidenceWorkspace}>
-        <div className={styles.evidenceRules}>
+        <fieldset className={styles.evidenceRules} disabled={submitting} aria-label="Evidence preparation">
           {plan.rules.map((rule) => {
             const input = draft.inputs[rule.type] ?? EMPTY_INPUT;
             const check = checkEvidence(rule, input);
@@ -113,15 +173,15 @@ export default function DisputeEvidence({ dispute, draft, onChange }: { dispute:
               <div className={styles.evidenceUpload}>
                 <label htmlFor={`${prefix}-files`}><Icon name="file" size={21} /><strong>Add evidence files</strong><span>JPG, JPEG, GIF, PNG, PDF · each under 10 MB</span></label>
                 <input className={styles.evidenceFileInput} id={`${prefix}-files`} type="file" multiple accept={EVIDENCE_FILE_ACCEPT} onChange={(event) => addFiles(rule.type, event)} />
-                <p>Included in Deflect analysis when you run assessment. Not sent to PayPal.</p>
+                <p>Used for Deflect analysis. Sent to PayPal only after confirmation.</p>
               </div>
               {(fileErrors[rule.type]?.length ?? 0) > 0 && <ul role="alert" className={styles.evidenceFileErrors}>{fileErrors[rule.type].map((message, index) => <li key={index}>{message}</li>)}</ul>}
-              {input.files.length > 0 && <ul className={styles.evidenceFiles} aria-label={`Selected files for ${rule.title}`}>{input.files.map((file) => <li key={fileKey(file)}><Icon name="file" size={16} /><div><strong>{file.name}</strong><span>{fileSize(file.size)} · Not sent to PayPal</span></div><button type="button" aria-label={`Remove ${file.name}`} onClick={() => { updateInput(rule.type, { files: input.files.filter((item) => item !== file) }); setFileErrors((previous) => ({ ...previous, [rule.type]: [] })); }}><Icon name="close" size={15} /></button></li>)}</ul>}
+              {input.files.length > 0 && <ul className={styles.evidenceFiles} aria-label={`Selected files for ${rule.title}`}>{input.files.map((file) => <li key={fileKey(file)}><Icon name="file" size={16} /><div><strong>{file.name}</strong><span>{fileSize(file.size)} · {draftWasSubmitted ? "Submitted to PayPal" : "Local draft"}</span></div><button type="button" aria-label={`Remove ${file.name}`} onClick={() => { updateInput(rule.type, { files: input.files.filter((item) => item !== file) }); setFileErrors((previous) => ({ ...previous, [rule.type]: [] })); }}><Icon name="close" size={15} /></button></li>)}</ul>}
               <p className={styles.evidenceDraftStatus}><Icon name={check.prepared ? "check" : "alert"} size={14} />{check.prepared ? "Draft prepared · contents need review" : rule.route === "manual" ? "Manual review required" : "Evidence still needed"}</p>
             </div>;
           })}
           {plan.hasSellerRequest && plan.baselineTypes.some((type) => !dispute.requestedEvidence.includes(type)) && <details className={styles.evidenceReference}><summary>Other evidence mentioned in the reason guide</summary><p>{plan.baselineTypes.filter((type) => !dispute.requestedEvidence.includes(type)).map(evidenceTitle).join("; ")}. These are reference options, not additional requests for this case.</p></details>}
-        </div>
+        </fieldset>
         <div className={styles.evidenceReview}>
           <div className={styles.blockHeading}><span><Icon name="sparkles" size={16} />Deflect assessment</span><Badge>AI + policy sources</Badge></div>
           <p className={styles.evidenceHint}>Analyze the latest case, your evidence and relevant policies to prepare the next step.</p>
@@ -135,25 +195,25 @@ export default function DisputeEvidence({ dispute, draft, onChange }: { dispute:
       <div className={styles.evidenceFooter}>
         <p>{allFiles.length} / {MAX_ASSESSMENT_FILES} local files · {fileSize(allFiles.reduce((sum, file) => sum + file.size, 0))} / 50 MB <a href={FILE_GUIDE_URL} target="_blank" rel="noreferrer">File requirements</a><span>Notes and attachments are sent to OpenAI when you run assessment.</span><span>Drafts and assessments stay with each case for this page session. Reloading clears them.</span></p>
         <div className={styles.evidenceActions}>
-          <button className={styles.primaryButton} onClick={runAssessment} disabled={assessing}><Icon name="sparkles" size={16} />{assessing ? "Assessing case…" : draft.assessment ? "Reassess case" : "Run Deflect assessment"}</button>
+          <button className={styles.primaryButton} onClick={runAssessment} disabled={assessing || submitting}><Icon name="sparkles" size={16} />{assessing ? "Assessing case…" : draft.assessment ? "Reassess case" : "Run Deflect assessment"}</button>
           {assessing && <button className={styles.secondaryButton} onClick={() => { requestRef.current?.abort(); requestRef.current = null; setAssessing(false); }}>Cancel assessment</button>}
-          <button className={styles.secondaryButton} disabled={!dispute.canProvideEvidence} onClick={() => { setSubmissionNotice(""); dialogRef.current?.showModal(); }}><Icon name="arrow" size={16} />Submit evidence to PayPal</button>
+          <button className={styles.secondaryButton} disabled={!canSubmitEvidence || submitting || draftWasSubmitted} onClick={openSubmission}><Icon name="arrow" size={16} />{submitting ? "Submitting evidence…" : draftWasSubmitted ? "Evidence submitted" : "Submit evidence to PayPal"}</button>
         </div>
       </div>
-      <p className={styles.supportNote}>PayPal submission currently opens a preview. Evidence submission and a formal appeal are separate actions.</p>
+      <p className={styles.supportNote}>Review and confirm before sending evidence to PayPal Sandbox. Evidence submission and a formal appeal are separate actions.</p>
       {submissionNotice && <p className={styles.evidenceSubmissionNotice} role="status">{submissionNotice}</p>}
+      {draft.submission && <p className={styles.evidenceSubmissionNotice}>Submission recorded · {draft.submission.submissionId} · {new Date(draft.submission.submittedAt).toLocaleString("en-US", { timeZone: "America/Los_Angeles" })} Pacific time</p>}
     </div>
 
-    <dialog className={styles.dialog} ref={dialogRef} aria-labelledby="evidence-preview-title">
-      <div className={styles.dialogHeader}><span className={styles.eyebrow}>SUBMISSION PREVIEW</span><button className={styles.closeButton} onClick={() => dialogRef.current?.close()} aria-label="Close evidence preview"><Icon name="close" /></button></div>
+    <dialog className={styles.dialog} ref={dialogRef} aria-labelledby="evidence-preview-title" onCancel={(event) => { if (submitLock.current) event.preventDefault(); else reviewRequestRef.current?.abort(); }}>
+      <div className={styles.dialogHeader}><span className={styles.eyebrow}>PAYPAL SANDBOX SUBMISSION</span><button className={styles.closeButton} disabled={submitting} onClick={closeSubmission} aria-label="Close evidence preview"><Icon name="close" /></button></div>
       <h2 id="evidence-preview-title">Review PayPal evidence</h2>
-      <p className={styles.dialogIntro}>Case {dispute.id}. PayPal submission is not connected; this preview sends no files.</p>
-      <ul className={styles.evidencePreviewList}>{plan.rules.map((rule) => {
-        const input = draft.inputs[rule.type] ?? EMPTY_INPUT;
-        return <li key={rule.type}><strong>{rule.title}</strong>{input.carrier && <p>Carrier: {input.carrier}</p>}{input.trackingNumber && <p>Tracking: {input.trackingNumber}</p>}{input.refundReference && <p>Refund reference: {input.refundReference}</p>}{input.notes && <p>{input.notes}</p>}{input.files.map((file) => <p key={fileKey(file)}>{file.name} · {fileSize(file.size)}</p>)}{!input.notes && !input.files.length && !input.carrier && !input.trackingNumber && !input.refundReference && <p>No evidence prepared.</p>}</li>;
-      })}</ul>
-      <p className={styles.dialogNote}>{preview.canPreviewSubmission ? "Required draft fields are present. The evidence contents still need your review." : preview.suggestion}{!preview.canPreviewSubmission && preview.checks.flatMap((check) => check.missing).map((item) => <span className={styles.evidenceMissingItem} key={item}>{item}</span>)}</p>
-      <div className={styles.dialogActions}><button className={styles.secondaryButton} onClick={() => dialogRef.current?.close()}>Close</button><button className={styles.primaryButton} disabled={!preview.canPreviewSubmission} onClick={() => { dialogRef.current?.close(); setSubmissionNotice("Preview complete. PayPal submission is not connected; no evidence was sent."); }}>Confirm preview</button></div>
+      <p className={styles.dialogIntro}>Case {dispute.id}. Confirming sends the notes, references and selected files below to PayPal Sandbox.</p>
+      {reviewing && <p role="status" className={styles.assessmentProgress}>Checking the latest case and preparing your evidence…</p>}
+      {submissionError && <p role="alert" className={styles.assessmentWarning}>{submissionError}</p>}
+      {review && <ul className={styles.evidencePreviewList}>{review.evidences.map((item) => <li key={item.type}><strong>{item.title}</strong>{item.carrier && <p>Carrier: {item.carrier}</p>}{item.trackingNumber && <p>Tracking: {item.trackingNumber}</p>}{item.refundReference && <p>Existing refund reference: {item.refundReference}</p>}{item.notes && <p>{item.notes}</p>}{item.documents.map((file) => <p key={file.uploadName}>{file.name} → {file.uploadName} · {fileSize(file.size)}</p>)}</li>)}</ul>}
+      <p className={styles.dialogNote}>{review ? "The latest case permits this submission. Check that every statement and document is accurate before confirming." : !reviewing && !submissionError ? preview.suggestion : ""} This submits evidence only. It does not create a refund or accept the buyer&apos;s claim.</p>
+      <div className={styles.dialogActions}><button className={styles.secondaryButton} disabled={submitting} onClick={closeSubmission}>Close</button><button className={styles.primaryButton} disabled={!review || reviewing || submitting} onClick={confirmSubmission}>{submitting ? "Submitting to PayPal…" : "Confirm & submit to Sandbox"}</button></div>
     </dialog>
   </section>;
 }

@@ -202,7 +202,7 @@ export default function LiveDisputeWorkspace({ onShowDemo }: { onShowDemo: () =>
           <div className={styles.safetyCard}>
             <Icon name="shield" size={22} /><strong>Evidence before action.</strong>
             <p>Dispute facts come directly from PayPal. Delivery still needs verification.</p>
-            <span><span className={styles.liveDot} />Sandbox · read only</span>
+            <span><span className={styles.liveDot} />Sandbox · evidence workspace</span>
           </div>
           <div className={styles.profile}>
             <span className={styles.avatar}>{initials(transaction?.merchantName)}</span>
@@ -223,7 +223,7 @@ export default function LiveDisputeWorkspace({ onShowDemo }: { onShowDemo: () =>
         <div className={styles.content}>
           <div className={styles.pageHeading}>
             <div><div className={styles.eyebrow}>CLARITY AT EVERY STEP</div><h1>Dispute workspace<span>.</span></h1><p>Understand the customer&apos;s concern and what needs attention.</p></div>
-            <span className={styles.modePill}><Icon name="lock" size={14} />Sandbox / Read only</span>
+            <span className={styles.modePill}><Icon name="lock" size={14} />Sandbox</span>
           </div>
 
           <section className={`${styles.caseCard} ${styles.supportSummary}`} aria-label="Dispute summary" aria-busy={loading}>
@@ -296,7 +296,12 @@ export default function LiveDisputeWorkspace({ onShowDemo }: { onShowDemo: () =>
               </div>
             </section>
           </div>
-          {dispute && <DisputeEvidence key={dispute.id} dispute={dispute} draft={evidenceDrafts[dispute.id] ?? EMPTY_CASE_EVIDENCE} onChange={(draft) => setEvidenceDrafts((previous) => ({ ...previous, [dispute.id]: draft }))} />}
+          {dispute && <DisputeEvidence key={dispute.id} dispute={dispute} draft={evidenceDrafts[dispute.id] ?? EMPTY_CASE_EVIDENCE} onChange={(draft) => setEvidenceDrafts((previous) => ({ ...previous, [dispute.id]: draft }))} onSubmitted={(submission) => {
+            const updated = submission.dispute;
+            if (!updated) return;
+            setResult((previous) => previous?.dispute.id === updated.id ? { ...previous, dispute: updated, fetchedAt: submission.submittedAt } : previous);
+            setItems((previous) => previous.map((item) => item.id === updated.id ? { ...item, status: updated.status, stage: updated.stage, updatedAt: updated.updatedAt } : item));
+          }} />}
           <footer className={styles.footer}><span><Icon name="shield" size={13} />Built on facts. Bounded by policy.</span><span>Deflect <span className={styles.footerDot}>·</span>PayPal Sandbox connection</span></footer>
         </div>
       </main>

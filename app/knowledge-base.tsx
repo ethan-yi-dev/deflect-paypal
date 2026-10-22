@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, type DragEvent, type FormEvent } from "react";
-import { KNOWLEDGE_FILE_ACCEPT, MAX_PDF_BYTES, type KnowledgeDeleteResult, type KnowledgeDocument, type KnowledgeList, type KnowledgeRetrieval, type KnowledgeSearchResult, type KnowledgeWriteResult, type ModelBinding, type SearchHit } from "@/lib/knowledge/types";
+import { KNOWLEDGE_FILE_ACCEPT, MAX_PDF_BYTES, type ActiveProcessing, type KnowledgeDeleteResult, type KnowledgeDocument, type KnowledgeList, type KnowledgeRetrieval, type KnowledgeSearchResult, type KnowledgeWriteResult, type ModelBinding, type SearchHit } from "@/lib/knowledge/types";
 import { Badge, Icon } from "./workspace-ui";
 import workspace from "./dispute-workspace.module.css";
 import styles from "./knowledge-base.module.css";
@@ -22,6 +22,16 @@ function fileSize(bytes: number) {
 
 function fileKey(file: File) {
   return `${file.name}-${file.size}-${file.lastModified}`;
+}
+
+function processingLabel(progress: ActiveProcessing | null) {
+  switch (progress?.stage) {
+    case "parse": return "Parsing document…";
+    case "chunk": return "Splitting text into chunks…";
+    case "embed": return `Embedding chunks ${progress.completedChunks}/${progress.totalChunks}…`;
+    case "store": return "Saving chunks and vectors…";
+    default: return "Starting processing…";
+  }
 }
 
 export function KnowledgeBaseButton({ active, onClick }: { active: boolean; onClick: () => void }) {
@@ -50,6 +60,7 @@ export default function KnowledgeBase({ hidden, onBack }: {
   const [textName, setTextName] = useState("");
   const [textContent, setTextContent] = useState("");
   const [startingId, setStartingId] = useState("");
+  const [activeProcessing, setActiveProcessing] = useState<ActiveProcessing | null>(null);
   const [deletingId, setDeletingId] = useState("");
   const [query, setQuery] = useState("");
   const [searching, setSearching] = useState(false);
@@ -64,20 +75,26 @@ export default function KnowledgeBase({ hidden, onBack }: {
   const uploadSection = useRef<HTMLElement>(null);
   const dragDepth = useRef(0);
   const removedIds = useRef(new Set<string>());
+  const processingRequest = useRef(false);
+  const listSequence = useRef(0);
+  const processingId = startingId || activeProcessing?.documentId || documents.find((document) => document.status === "running")?.id;
+  const processingName = activeProcessing?.documentName || documents.find((document) => document.id === processingId)?.name;
 
   const reload = useCallback(async (signal?: AbortSignal) => {
+    const sequence = ++listSequence.current;
     try {
       const result = await readApi<KnowledgeList>("/api/knowledge-base/documents", { signal });
-      if (signal?.aborted) return;
+      if (signal?.aborted || sequence !== listSequence.current) return;
       // A poll started before deletion must not put the removed row back.
       setDocuments(result.documents.filter((document) => !removedIds.current.has(document.id)));
+      setActiveProcessing(result.activeProcessing);
       setBinding(result.knowledgeBase);
       setListError("");
       return result;
     } catch (error) {
-      if (!signal?.aborted) setListError(error instanceof Error ? error.message : "Could not load documents.");
+      if (!signal?.aborted && sequence === listSequence.current) setListError(error instanceof Error ? error.message : "Could not load documents.");
     } finally {
-      if (!signal?.aborted) setLoading(false);
+      if (!signal?.aborted && sequence === listSequence.current) setLoading(false);
     }
   }, []);
 
@@ -91,11 +108,11 @@ export default function KnowledgeBase({ hidden, onBack }: {
     let timer: ReturnType<typeof setTimeout>;
     async function poll() {
       const result = await reload(controller.signal);
-      if (!controller.signal.aborted) timer = setTimeout(() => void poll(), result?.documents.some((item) => item.status === "running") ? 2000 : 10000);
+      if (!controller.signal.aborted) timer = setTimeout(() => void poll(), processingRequest.current || result?.activeProcessing || result?.documents.some((item) => item.status === "running") ? 2000 : 10000);
     }
     void poll();
     return () => { controller.abort(); clearTimeout(timer); };
-  }, [hidden, reload]);
+  }, [hidden, reload, startingId]);
 
   async function uploadDocuments() {
     setUploading(true);
@@ -126,7 +143,7 @@ export default function KnowledgeBase({ hidden, onBack }: {
       }
       setActionError(failures.join(" "));
       if (results.length === 1) setNotice(results[0].message);
-      else if (results.length) setNotice(`${results.filter((item) => item.changed).length} documents saved as pending. ${results.filter((item) => !item.changed).length} unchanged. Start chunking for changed documents.`);
+      else if (results.length) setNotice(`${results.filter((item) => item.changed).length} documents saved as pending. ${results.filter((item) => !item.changed).length} unchanged. Click Process document for each changed document.`);
       if (results.length && updateTarget) setUpdateTarget(null);
       if (results.some((item) => item.changed)) setHits(null);
       await reload();
@@ -154,18 +171,27 @@ export default function KnowledgeBase({ hidden, onBack }: {
     setTextContent("");
   }
 
-  async function startIndexing(document: KnowledgeDocument) {
+  async function processDocument(document: KnowledgeDocument) {
+    if (processingRequest.current || processingId || loading || listError) return;
+    processingRequest.current = true;
+    ++listSequence.current;
     setStartingId(document.id);
     setActionError("");
     setNotice("");
     setHits(null);
     try {
       const result = await readApi<{ document: KnowledgeDocument }>(`/api/knowledge-base/documents/${document.id}/index`, { method: "POST" });
+      ++listSequence.current;
       setDocuments((previous) => previous.map((item) => item.id === document.id ? result.document : item));
-      setNotice(`Indexing queued for ${document.name}. Status updates automatically while this page is open.`);
+      if (result.document.status === "success") setNotice(`${document.name}: processing complete. ${result.document.chunkCount} chunks and their embeddings were saved.`);
+      else setActionError(`${document.name}: ${result.document.errorMessage || "Processing failed. Retry processing."}`);
     } catch (error) {
-      setActionError(error instanceof Error ? error.message : "Could not start indexing.");
-    } finally { setStartingId(""); await reload(); }
+      setActionError(error instanceof Error ? error.message : "Could not process the document. Refresh to check its status.");
+    } finally {
+      await reload();
+      processingRequest.current = false;
+      setStartingId("");
+    }
   }
 
   async function deleteDocument(document: KnowledgeDocument) {
@@ -289,7 +315,7 @@ export default function KnowledgeBase({ hidden, onBack }: {
               </div>}
 
               <div className={styles.uploadFooter}>
-                <p>{updateTarget ? "Unchanged content keeps its current index. Changes return to pending; start chunking below to rebuild all vectors." : "Documents are saved as pending. Identical uploads are skipped. Start chunking below to make changed content searchable."}</p>
+                <p>{updateTarget ? "Unchanged content keeps its current index. Changes return to pending; click Process document below to rebuild all vectors." : "Documents are saved as pending. Click Process document to parse, split, embed, and save one document at a time."}</p>
                 <button type="button" className={workspace.primaryButton} disabled={uploading || !!deletingId || (inputMode === "file" ? !files.length : !textName.trim() || !textContent.trim())} onClick={() => void uploadDocuments()}><Icon name="upload" size={15} />{uploading ? "Saving…" : updateTarget ? "Save update" : inputMode === "text" ? "Save text" : "Upload documents"}</button>
               </div>
               {actionError && <p className={styles.errors} role="alert">{actionError}</p>}
@@ -303,6 +329,7 @@ export default function KnowledgeBase({ hidden, onBack }: {
               <div className={styles.documentControls}><Badge>{documents.length} document{documents.length === 1 ? "" : "s"}</Badge><button type="button" className={workspace.refreshButton} disabled={loading} aria-label="Refresh knowledge documents" onClick={() => { setLoading(true); void reload(); }}><Icon name="refresh" size={14} /></button></div>
             </div>
             {binding && <p className={styles.modelNote}>Embedding model: <strong>{binding.embeddingModel}</strong> · {binding.embeddingDimensions} dimensions · Bound to this knowledge base</p>}
+            {processingId && <p className={styles.processingNote} role="status"><strong>{processingName || "A document"}</strong>: {processingLabel(activeProcessing)} Other documents can be processed after this one succeeds or fails.</p>}
             {listError && <p className={styles.listError} role="alert">{listError}</p>}
             <div className={styles.tableScroll}>
               <table className={styles.documentsTable}>
@@ -313,9 +340,9 @@ export default function KnowledgeBase({ hidden, onBack }: {
                     <td><a className={styles.documentName} href={`/api/knowledge-base/documents/${document.id}/source`}><Icon name="file" size={17} />{document.name}</a><span className={styles.documentHash} title={`Document ID: ${document.id}\nSHA-256: ${document.contentHash}`}>v{document.sourceVersion} · SHA-256 {document.contentHash?.slice(0, 12)}…</span>{document.errorMessage && <span className={styles.documentError}>{document.errorMessage}</span>}</td>
                     <td>{fileSize(document.size)}</td>
                     <td><time dateTime={document.uploadedAt}>{new Intl.DateTimeFormat("en-US", { dateStyle: "medium", timeZone: "America/Los_Angeles" }).format(new Date(document.uploadedAt))}</time></td>
-                    <td><Badge tone={document.status === "success" ? "green" : document.status === "failed" ? "red" : document.status === "running" ? "amber" : "neutral"}>{document.status}</Badge></td>
-                    <td>{document.status === "success" ? document.chunkCount : "—"}</td>
-                    <td><div className={styles.rowActions}><button type="button" className={`${workspace.secondaryButton} ${styles.indexButton}`} disabled={document.status === "running" || !!startingId || !!deletingId || uploading} onClick={() => beginUpdate(document)}>Update</button><button type="button" className={`${workspace.secondaryButton} ${styles.indexButton}`} disabled={document.status === "running" || !!startingId || !!deletingId || uploading || updateTarget?.id === document.id} onClick={() => void startIndexing(document)}>{document.status === "running" || startingId === document.id ? "Running…" : document.status === "failed" ? "Retry chunking" : document.status === "success" ? "Reindex" : "Start chunking"}</button><button type="button" className={`${workspace.secondaryButton} ${styles.deleteButton}`} disabled={!!deletingId || !!startingId || uploading} title="Exclude this document and its chunks from search; keep the stored source and vectors" aria-label={`Delete ${document.name} from knowledge base`} onClick={() => void deleteDocument(document)}>{deletingId === document.id ? "Removing…" : "Delete"}</button></div></td>
+                    <td><Badge tone={document.status === "running" || startingId === document.id ? "amber" : document.status === "success" ? "green" : document.status === "failed" ? "red" : "neutral"}>{startingId === document.id ? "running" : document.status}</Badge>{activeProcessing?.documentId === document.id && <span className={styles.processingStage}>{processingLabel(activeProcessing)}</span>}</td>
+                    <td>{document.status === "success" && startingId !== document.id ? document.chunkCount : "—"}</td>
+                    <td><div className={styles.rowActions}><button type="button" className={`${workspace.secondaryButton} ${styles.indexButton}`} disabled={!!processingId || !!deletingId || uploading} onClick={() => beginUpdate(document)}>Update</button><button type="button" className={`${workspace.secondaryButton} ${styles.indexButton}`} disabled={!!processingId || loading || !!listError || !!deletingId || uploading || updateTarget?.id === document.id} title={processingId && processingId !== document.id ? "Wait for the current document to succeed or fail." : "Parse, split into chunks, generate embeddings, and save this document."} onClick={() => void processDocument(document)}>{processingId === document.id ? "Processing…" : document.status === "failed" ? "Retry processing" : document.status === "success" ? "Reprocess" : "Process document"}</button><button type="button" className={`${workspace.secondaryButton} ${styles.deleteButton}`} disabled={!!deletingId || !!processingId || uploading} title="Exclude this document and its chunks from search; keep the stored source and vectors" aria-label={`Delete ${document.name} from knowledge base`} onClick={() => void deleteDocument(document)}>{deletingId === document.id ? "Removing…" : "Delete"}</button></div></td>
                   </tr>) : <tr><td colSpan={6}>
                     <div className={styles.emptyState}><span><Icon name="book" size={28} /></span><h3>{loading ? "Loading documents…" : listError ? "Documents are unavailable" : "No uploaded documents yet"}</h3><p>{listError ? "Check the connection message above, then refresh." : "Upload a document or paste text above to add it to your knowledge base."}</p></div>
                   </td></tr>}

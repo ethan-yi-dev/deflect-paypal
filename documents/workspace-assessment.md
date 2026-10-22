@@ -74,5 +74,7 @@ reloading the page clears them. Durable evidence storage and assessment history
 are not implemented by this workflow.
 
 Uploads remain available when PayPal evidence submission is unavailable. Analysis
-does not execute a PayPal action; the existing submission preview remains separate.
+does not execute a PayPal action. The separate evidence confirmation flow can
+submit the reviewed notes, references and files to PayPal Sandbox; see
+[PayPal evidence submission](../README.md#paypal-evidence-submission).
 Run `npm run test:assessment` for mocked provider and input validation tests.

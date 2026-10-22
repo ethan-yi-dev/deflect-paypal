@@ -9,7 +9,11 @@ export class PayPalDisputesError extends Error {
   }
 }
 
-// This client performs OAuth and read-only GETs. It never follows provider links.
+export class PayPalEvidenceError extends PayPalDisputesError {
+  constructor(code: string, message: string, status: number, public readonly outcome: "rejected" | "unknown", debugId?: string) { super(code, message, status, debugId); }
+}
+
+// Fixed Sandbox URLs only. Evidence POSTs are explicit and are never retried.
 export function createPayPalDisputesClient(
   credentials: () => { clientId?: string; secret?: string },
   request: typeof fetch = fetch,
@@ -109,6 +113,30 @@ export function createPayPalDisputesClient(
         if (dispute.id !== id) throw new Error("Dispute ID mismatch.");
         return dispute;
       } catch { throw new PayPalDisputesError("PAYPAL_INVALID_RESPONSE", "PayPal returned an invalid dispute detail response.", 502); }
+    },
+    async provideEvidence(id: string, packet: { body: Uint8Array<ArrayBuffer>; contentType: string }) {
+      if (!/^[A-Za-z0-9-]{1,255}$/.test(id)) throw new PayPalEvidenceError("INVALID_DISPUTE_ID", "Enter a valid dispute ID.", 400, "rejected");
+      let token: string;
+      try { token = await getToken(); }
+      catch { throw new PayPalEvidenceError("PAYPAL_AUTH_FAILED", "PayPal could not authenticate the Sandbox app. No evidence request was sent.", 502, "rejected"); }
+      let response: Response;
+      try {
+        response = await request(`${PAYPAL_SANDBOX}/v1/customer/disputes/${encodeURIComponent(id)}/provide-evidence`, {
+          method: "POST", redirect: "error", cache: "no-store", signal: AbortSignal.timeout(60000),
+          headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": packet.contentType }, body: packet.body,
+        });
+      } catch { throw new PayPalEvidenceError("EVIDENCE_OUTCOME_UNKNOWN", "The PayPal evidence request did not return a confirmed result. PayPal may have received it. Refresh the case and verify its evidence before any further submission.", 503, "unknown"); }
+      const debugId = response.headers.get("paypal-debug-id") ?? undefined;
+      if (response.status === 200) return { debugId: debugId ?? null };
+      if (response.status === 401) cachedToken = undefined;
+      if ([400, 401, 403, 404, 409, 413, 415, 422, 429].includes(response.status)) {
+        const advice = response.status === 403 ? "Check Disputes API access and the update-seller permission."
+          : response.status === 401 ? "Check the Sandbox credentials, then review the case again."
+          : response.status === 429 ? "Wait before reviewing and submitting again."
+          : "Refresh the case and check its requested evidence, references and file contents.";
+        throw new PayPalEvidenceError("PAYPAL_EVIDENCE_REJECTED", `PayPal rejected the evidence (HTTP ${response.status}). ${advice}`, response.status === 401 || response.status === 403 ? 502 : response.status, "rejected", debugId);
+      }
+      throw new PayPalEvidenceError("EVIDENCE_OUTCOME_UNKNOWN", `PayPal returned HTTP ${response.status} without confirming the evidence submission. Verify the case in PayPal before any further submission.`, 503, "unknown", debugId);
     },
   };
 }

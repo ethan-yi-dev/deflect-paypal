@@ -12,7 +12,7 @@ async function main() {
       await query("SELECT pg_advisory_xact_lock(746483921)");
       for (const sql of migrations) await query(sql);
     });
-    console.info("Knowledge schema is ready (PostgreSQL + pgvector).");
+    console.info("Database schema is ready (knowledge base and evidence submissions).");
   } finally { await pool.end(); }
 }
 main().catch(() => { console.error("Migration failed. Check DATABASE_URL, database permissions, and the pgvector extension."); process.exitCode = 1; });

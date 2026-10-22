@@ -9,8 +9,8 @@ Built with Next.js, React, and TypeScript for the
 
 > **Current scope:** dispute queries use the configured PayPal Sandbox account.
 > Deflect assessment combines case data, uploaded evidence and policy retrieval
-> through OpenAI. PayPal submission remains a local preview. Policy/JEV validation
-> and real dispute actions are planned integrations.
+> through OpenAI. Merchants can review and confirm evidence submissions to PayPal
+> Sandbox. Policy/JEV validation, refunds and other dispute actions are planned integrations.
 
 ## Current features
 
@@ -22,9 +22,9 @@ Built with Next.js, React, and TypeScript for the
 | Evidence preparation | Displays fields according to the dispute reason and the evidence requested from the seller. |
 | File selection | Validates PDF/image evidence, supports removal, and keeps drafts separate by case even when PayPal submission is unavailable. |
 | Deflect assessment | Combines a fresh case snapshot, actual attachments and top K policy passages into a cited assessment, recommendation, evidence checklist and response draft. Marks earlier results for reassessment after edits. |
-| PayPal submission | Opens a review preview when the case offers evidence submission; sends no evidence or action requests. |
+| PayPal submission | Validates the current seller request, previews the exact evidence, and sends it to PayPal Sandbox after merchant confirmation. Persists receipts and prevents duplicate submissions. |
 | Demo studio | Offers three fixed scenarios with predefined recommendations, Policy/JEV results, and a simulated audit trail. |
-| RAG knowledge base | Stores and versions PDF/text sources, indexes them asynchronously, and retrieves evidence with pgvector and Cohere reranking. Includes SHA-256 change detection, soft deletion, and worker recovery. See [RAG pipeline](#rag-pipeline-and-knowledge-base). |
+| RAG knowledge base | Stores and versions PDF/text sources, processes one selected document per request, and retrieves evidence with pgvector and Cohere reranking. Includes SHA-256 change detection, soft deletion, persisted progress, and interrupted-request recovery. See [RAG pipeline](#rag-pipeline-and-knowledge-base). |
 
 The support details use neutral cards. **Evidence & next steps** is a separate
 **ACTION WORKSPACE**, with a dark green header, highlighted border, and its own
@@ -126,7 +126,7 @@ In **Evidence & next steps**:
 1. Review the evidence labeled **Requested by PayPal**. Fill the relevant carrier,
    tracking, refund reference, or note fields.
 2. Choose files in **Add evidence files**, including when submission is unavailable.
-   The list shows each file's name, size, and **Not sent to PayPal** status. Remove any
+   The list shows each file's name, size, and **Local draft** status. Remove any
    file you do not want to include.
 3. Click **Run Deflect assessment** to send the notes and actual files to OpenAI,
    together with a fresh PayPal case and up to 6 relevant policy passages by default.
@@ -134,10 +134,11 @@ In **Evidence & next steps**:
    Edits mark the previous result for reassessment. See the
    [workspace assessment guide](documents/workspace-assessment.md) for configuration,
    source handling, limits and the API contract.
-4. Click **Submit evidence to PayPal** to review the local submission preview.
-   **Confirm preview** is enabled only when a seller request is present and the
-   required draft fields pass the basic check. Confirmation displays a local
-   notice; it does not contact PayPal.
+4. Click **Submit evidence to PayPal** to prepare a server-validated preview of the
+   notes, references and files. **Confirm & submit to Sandbox** sends exactly that
+   reviewed package to PayPal. The server checks the case again before sending;
+   success records a receipt and refreshes the case. See
+   [PayPal evidence submission](#paypal-evidence-submission) for setup and request details.
 
 Files already returned by PayPal as seller-submitted documents appear separately
 under **Files already on PayPal**. Selecting a local file does not add it to that
@@ -302,8 +303,8 @@ knowledge-base access controls.
 ```mermaid
 flowchart TD
     upload["Upload PDF / TXT / Markdown / text"] --> pending["Store original and SHA-256: pending"]
-    pending -->|"Start chunking: atomic CAS"| worker["PostgreSQL queue and indexing worker"]
-    worker --> parse["PDF: LlamaParse; text: direct input"]
+    pending -->|"Process document"| request["HTTP request: one active file per knowledge base"]
+    request --> parse["PDF: LlamaParse; text: direct input"]
     parse --> chunk["LlamaIndex chunking: 512 tokens, overlap 64"]
     chunk --> embed["Google document embedding"]
     embed --> store[("PostgreSQL + pgvector: success")]
@@ -328,7 +329,7 @@ database. The bundled [compose.yaml](compose.yaml) runs PostgreSQL 17 with pgvec
 | `t_knowledge_base` | Knowledge-base ID and immutable embedding model/dimension binding. |
 | `t_knowledge_document` | PDF bytes in `pdf_data` or UTF-8 `text_content`, SHA-256, source version, processing status, timestamps, and soft-delete flag. |
 | `t_knowledge_chunk` | Chunk text, page, sequence, model binding, and vector; linked to its document by `doc_id`. |
-| `t_knowledge_job` | Durable indexing attempts, source hash snapshots, leases, and execution/error records. |
+| `t_knowledge_job` | Request processing history, source hash snapshots, progress, leases, and execution/error records. |
 
 ### Configuration and startup
 
@@ -368,21 +369,15 @@ Once PostgreSQL is healthy, apply the numbered migrations:
 npm run db:migrate
 ```
 
-Start the application in one terminal:
+Start the application:
 
 ```bash
 npm run dev
 ```
 
-Start the indexing worker in another terminal:
-
-```bash
-npm run worker:knowledge
-```
-
-If the app is already running, start only the worker. Restart the app and worker
-after changing their environment configuration. Production runs the built Next.js
-app and worker as separate supervised processes.
+No separate worker or queue service is needed. Restart the app after changing
+environment configuration. Production uses `npm run build` and `npm run start`.
+Apply the migrations after upgrading, including `005_request_document_processing.sql`.
 
 The first use binds the embedding model and dimensions to the knowledge base.
 Indexing and query both verify that binding, and a database trigger prevents
@@ -394,22 +389,22 @@ require rebuilding embeddings.
 
 Upload nonempty PDF, UTF-8 TXT, or Markdown files up to **50 MiB each**, or use
 **Paste text**. Saving a source stores it as `pending`; indexing starts only when
-the user clicks **Start chunking**.
+the user clicks **Process document**.
 
 ```text
 Upload -> pending
-Start chunking -> running (queued, then consumed by a worker)
+Process document -> running (the initiating HTTP request executes this file only)
 Parse -> Chunk -> Embed -> Store -> success
-Processing error or expired worker lease -> failed -> manual retry
+Processing error, cancellation, or expired request lease -> failed -> manual retry
 ```
 
 | Action | Behavior |
 | --- | --- |
-| **Start chunking** | Atomically sets `running` only if the document is not already running, then inserts a durable job in the same transaction. |
+| **Process document** | Reserves the knowledge base's single processing slot and runs parse, chunking, sequential embedding, and persistence in the initiating request. Other process buttons stay disabled until success or failure. Concurrent requests return 409. |
 | **Update**, unchanged SHA-256 | Returns **No changes**; preserves the source, version, timestamps, chunks, and vectors. No indexing job is created. |
-| **Update**, changed SHA-256 | Checks the current hash with `If-Match`, keeps the document ID, increments the version, deletes old vectors, and returns to `pending` in one transaction. Click **Start chunking** to rebuild. |
-| **Reindex** | Forces a full rebuild of the stored source, including removal of old vectors, even when its hash is unchanged. |
-| **Retry chunking** | Manually starts another attempt after a failed job. |
+| **Update**, changed SHA-256 | Checks the current hash with `If-Match`, keeps the document ID, increments the version, deletes old vectors, and returns to `pending` in one transaction. Click **Process document** to rebuild. |
+| **Reprocess** | Forces a full rebuild of the stored source, including removal of old vectors, even when its hash is unchanged. |
+| **Retry processing** | Manually starts another attempt after a failure. |
 | **Delete** | Sets `deleted_at`; retains the original, chunks, vectors, and job history while excluding them from the list and search. Repeated deletion is idempotent. |
 
 Active names are unique within each base. Uploading the same name and bytes is a
@@ -417,11 +412,18 @@ no-op; different bytes under an existing name require **Update** by document ID.
 After soft deletion, the same name can be uploaded as a new document with a new ID.
 There is no restore action in the current UI.
 
-Each job has a two-minute lease renewed every 30 seconds. The active run ID,
-source hash, and live lease prevent stale workers from publishing results. New
+Each processing request has a two-minute lease renewed every 30 seconds. The active run ID,
+source hash, and live lease prevent stale requests from publishing results. New
 chunks and `success` commit together; a processing failure leaves no old or
 partially written index. Deleted documents cannot be reactivated by an in-flight
-worker. Changed updates are rejected while indexing is running.
+request. Changed updates are rejected while indexing is running. Stage and embedding
+counts persist in PostgreSQL and are shown while processing. Listing documents or
+starting processing marks expired attempts and legacy queued attempts as failed;
+they require a manual retry and never start another document automatically.
+
+The request stays open until success or failure, with a 15-minute application
+deadline. Hosting must allow the complete processing request to finish; removing
+the worker does not remove the host's request-duration or upload-size limits.
 
 While the knowledge-base view is open, the UI polls after each response: every
 2 seconds when a document is running, otherwise every 10 seconds. Navigation away
@@ -467,7 +469,7 @@ currently applied.
 | `POST /api/knowledge-base/query` | Retrieve and rerank evidence chunks. |
 
 `npm run test:knowledge` runs PostgreSQL/pgvector tests with PGlite and mocked
-provider contracts. Coverage includes concurrency, rollback, worker recovery,
+provider contracts. Coverage includes concurrency, rollback, interrupted-request recovery,
 hash updates, soft deletion, reranking, fallback, and eligibility checks after
 concurrent document changes. These tests require no external database, API keys,
 or paid provider calls; retrieval quality still needs evaluation on real business
@@ -489,7 +491,7 @@ The actual case's evidence request takes precedence:
 - `reason` selects the baseline guidance.
 - Only `evidences[]` entries with `source: REQUESTED_FROM_SELLER` become seller requirements.
 - Their `evidence_type` values determine which fields are shown.
-- A POST link with `rel: provide_evidence` or `provide-evidence` and a nonempty `href` enables file selection and the submission preview.
+- A POST link with `rel: provide_evidence` or `provide-evidence` and a nonempty `href`, together with `WAITING_FOR_SELLER_RESPONSE`, enables the submission preview. File selection for analysis remains available independently.
 
 If no specific seller request is returned, the page labels the baseline entries
 **Reference option**. These are possible alternatives, not a requirement to
@@ -508,7 +510,7 @@ approve a financial action. A selected file can satisfy a draft check while its
 actual contents still need review.
 
 Providing evidence through `provide-evidence` and making a formal `appeal` are
-separate PayPal actions. The current preview prepares evidence submission;
+separate PayPal actions. The confirmation dialog submits evidence to Sandbox;
 formal appeals are not implemented. See
 [PayPal's Disputes API guide](https://developer.paypal.com/platforms/disputes/handle-disputes/use-disputes-api/).
 
@@ -522,7 +524,66 @@ Following PayPal's
 - Up to **50 MB total** across the selected files for a case.
 
 The local validator checks the extension, the MIME type when the browser supplies
-one, and file sizes. These checks do not validate the file contents.
+one, and file sizes. The server also checks file signatures. These checks do not
+authenticate documents or establish that their contents prove the merchant's claim.
+
+## PayPal evidence submission
+
+The live workspace supports the
+[Provide evidence API](https://developer.paypal.com/api/customer-disputes/v1/disputes-provide-evidence),
+using the existing Sandbox credentials. The REST app must have Disputes access,
+including the `https://uri.paypal.com/services/disputes/update-seller` permission.
+The backend sends requests only to the fixed `api-m.sandbox.paypal.com` host.
+
+Run `npm run db:migrate` after updating the application. Migration
+[`004_evidence_submissions.sql`](db/migrations/004_evidence_submissions.sql) creates
+the durable submission records. Evidence submission requires this database even
+when policy retrieval is not being used. No additional API key is required.
+
+### Review and submit
+
+`POST /api/disputes/{id}/evidence` accepts the same multipart `inputs` JSON array and
+referenced file parts as assessment. It has two explicitly separated modes:
+
+| Header | Behavior |
+| --- | --- |
+| `X-Evidence-Mode: preview` (default) | Validates the upload, reloads the case and returns the exact package for review. No evidence POST is sent to PayPal. |
+| `X-Evidence-Mode: submit` plus `X-Evidence-Review: <reviewToken>` | Verifies the signed review, uploaded material and current case, then reserves and sends the confirmed submission. |
+
+The confirmation expires after 10 minutes and is bound to the merchant, dispute,
+case snapshot, evidence fields and actual attachment bytes. Edits or case changes
+require a fresh review. The backend requires `WAITING_FOR_SELLER_RESPONSE`, a
+current `provide-evidence` action, and complete evidence for the specific seller
+request. Unsupported reasons/types remain subject to manual review. AI output
+does not authorize submission or bypass these checks.
+
+The outbound multipart body contains an `input` JSON part and actual binary file
+parts. Fulfillment references map to `evidence_info.tracking_info`; an existing
+refund reference maps to `evidence_info.refund_ids` and never creates a refund.
+Free-form carrier names use PayPal's `OTHER` carrier with `carrier_name_other`.
+Files receive unique names such as `evidence-1.pdf` to meet PayPal's filename
+constraints and preserve evidence-to-file associations. The preview shows each
+original-to-upload filename mapping.
+
+### Receipts and retry handling
+
+After PayPal confirms success with HTTP 200, the application stores a receipt and
+reloads the case. A failed refresh still returns the accepted submission receipt.
+PostgreSQL stores operation IDs, merchant scope, case/payload hashes, outcome and
+receipt metadata; it does not store uploaded evidence contents or evidence notes.
+
+Database constraints prevent concurrent submissions for the same case and repeat
+submissions of the same reviewed package. Repeating a completed confirmation
+returns its stored receipt. Explicit provider rejections require a new review
+before an intentional retry. Evidence POSTs are never automatically retried.
+Timeouts, connection failures and ambiguous provider responses retain a blocking
+`pending` or `unknown` record. An operator must verify the case in PayPal and
+reconcile that record before allowing another submission; there is no automatic
+expiry or UI override for uncertain operations.
+
+This submits evidence only. Formal appeals, claim acceptance, refunds and other
+financial actions are separate integrations. The application still uses one
+configured Sandbox merchant and does not provide production application authentication.
 
 ## Demo studio
 
@@ -548,7 +609,7 @@ never fall back to the demo fixtures. Demo state resets when leaving the studio.
 ```text
 Browser → Next.js /api/disputes → PayPal Sandbox Disputes REST API
         → Next.js /api/disputes/{id}/assessment → Policy retrieval + OpenAI
-        → Local evidence rules and submission preview
+        → Next.js /api/disputes/{id}/evidence → Merchant-confirmed Sandbox evidence
 ```
 
 | Endpoint | Response |
@@ -556,39 +617,42 @@ Browser → Next.js /api/disputes → PayPal Sandbox Disputes REST API
 | `GET /api/disputes` | `items`, `fetchedAt`, and `environment: sandbox`; first list page only. |
 | `GET /api/disputes/{id}` | Normalized `dispute` details, `fetchedAt`, and `environment: sandbox`. |
 | `POST /api/disputes/{id}/assessment` | Cited assessment and recommendation, source snapshot, retrieval diagnostics, warnings and model metadata. |
+| `POST /api/disputes/{id}/evidence` | Server-validated preview or a confirmed Sandbox evidence receipt and refreshed case. |
 
 The Disputes client obtains and caches an OAuth token, shares concurrent token
 requests, and retries a GET once after a rejected token. IDs are validated before
 querying PayPal. Dispute responses use `private, no-store`, and provider errors
 are sanitized. Credentials and tokens are not returned to the browser. The
-Disputes client uses a fixed Sandbox host and never follows action links or
-performs dispute mutations.
+Disputes client uses a fixed Sandbox host and never follows provider-supplied URLs.
+It performs case reads and the explicitly confirmed `provide-evidence` POST only.
 
 The API detail response retains operational fields for future backend work;
 the frontend chooses the customer support fields to display. Knowledge-base upload,
 update, soft deletion, indexing, and reranked search endpoints are implemented
-separately. PayPal evidence submission, execution, and appeal endpoints remain
-planned integrations.
+separately. PayPal evidence submission uses its own confirmation and receipt flow;
+other dispute mutations and appeal endpoints remain planned integrations.
 
 | File | Responsibility |
 | --- | --- |
 | [app/live-dispute-workspace.tsx](app/live-dispute-workspace.tsx) | Live case list, customer context, selection, and case drafts. |
-| [app/dispute-evidence.tsx](app/dispute-evidence.tsx) | Evidence fields, local file lists, assessment results, and submission preview. |
+| [app/dispute-evidence.tsx](app/dispute-evidence.tsx) | Evidence fields, file lists, assessment results, server review and submission confirmation. |
 | [app/case-assessment.tsx](app/case-assessment.tsx) | Assessment findings, recommendation, cited draft, source navigation and reassessment status. |
 | [lib/assessment/](lib/assessment/) | Bounded uploads, case context, policy search query, OpenAI request and structured output validation. |
+| [lib/evidence/](lib/evidence/) | Evidence packaging, signed reviews, case checks, durable duplicate protection and submission orchestration. |
 | [lib/dispute-evidence.ts](lib/dispute-evidence.ts) | Baseline evidence rules, draft checks, and file validation. |
 | [lib/disputes.ts](lib/disputes.ts) | Shared types and normalization of PayPal responses. |
 | [lib/paypal-disputes.ts](lib/paypal-disputes.ts) | Server-only facade and sanitized API error responses. |
-| [lib/paypal-disputes-client.ts](lib/paypal-disputes-client.ts) | OAuth and read-only Disputes REST requests. |
+| [lib/paypal-disputes-client.ts](lib/paypal-disputes-client.ts) | OAuth, dispute reads and a non-retrying Sandbox evidence POST. |
 | [app/dispute-workspace.tsx](app/dispute-workspace.tsx) | Mode switching and the static demo studio. |
 | [app/knowledge-base.tsx](app/knowledge-base.tsx) | Document management, indexing controls, status polling, and search results. |
-| [lib/knowledge/](lib/knowledge/) | Configuration, PostgreSQL repository, document validation, providers, worker processing, retrieval, and reranking. |
-| [scripts/knowledge-worker.ts](scripts/knowledge-worker.ts) | Standalone durable indexing worker. |
+| [lib/knowledge/](lib/knowledge/) | Configuration, PostgreSQL repository, document validation, providers, request processing, retrieval, and reranking. |
+| [lib/knowledge/processing.ts](lib/knowledge/processing.ts) | Selected-document parse/chunk/embed/persist pipeline, awaited by the initiating request. |
 | [db/migrations/](db/migrations/) | Repeatable PostgreSQL and pgvector schema migrations. |
 | [tests/paypal-disputes.test.ts](tests/paypal-disputes.test.ts) | Mocked API client, normalization, evidence, and file checks. |
-| [tests/knowledge-base.test.ts](tests/knowledge-base.test.ts) | PostgreSQL/pgvector storage, document lifecycle, CAS, worker recovery, and retrieval eligibility tests. |
+| [tests/knowledge-base.test.ts](tests/knowledge-base.test.ts) | PostgreSQL/pgvector storage, document lifecycle, single-file admission, request recovery, and retrieval eligibility tests. |
 | [tests/knowledge-rerank.test.ts](tests/knowledge-rerank.test.ts) | Rerank API contract, result mapping, fallback, timeout, and cancellation checks. |
 | [tests/case-assessment.test.ts](tests/case-assessment.test.ts) | Assessment input limits, actual attachment transmission, source integrity, action availability and provider failure handling. |
+| [tests/paypal-evidence.test.ts](tests/paypal-evidence.test.ts) | Multipart evidence, review binding, durable duplicate protection, provider rejections and uncertain submission outcomes. |
 
 The original SDK pages remain available:
 
@@ -611,10 +675,10 @@ expose a Disputes controller.
 | `npm run dev` | Start the UI and API routes in development. |
 | `npm run lint` | Run ESLint. |
 | `npm run test:disputes` | Compile and run the mocked Disputes and evidence checks with Node's test runner. |
-| `npm run test:knowledge` | Test PostgreSQL/pgvector storage, document lifecycle, worker recovery, and retrieval/reranking with mocked providers. |
+| `npm run test:knowledge` | Test PostgreSQL/pgvector storage, document lifecycle, processing recovery, and retrieval/reranking with mocked providers. |
 | `npm run test:assessment` | Test assessment uploads, source context, OpenAI contract, citations, fallback and cancellation with mocked providers. |
-| `npm run db:migrate` | Initialize the PostgreSQL knowledge-base schema and pgvector extension. |
-| `npm run worker:knowledge` | Run the durable indexing queue worker alongside the Next.js server. |
+| `npm run test:evidence` | Test evidence review/submission with PGlite and mocked PayPal; never sends real evidence. |
+| `npm run db:migrate` | Initialize the knowledge-base and evidence-submission schemas and pgvector extension. |
 | `npm run build` | Build the production application and check TypeScript. |
 | `npm run start` | Serve an existing production build. |
 
@@ -633,15 +697,17 @@ Next.js build both write generated files under `.next`.
 | PayPal is not configured | Fill both values in `.env.local` and restart the dev server. |
 | Authentication or access error | Check the Sandbox credentials and the app/merchant's Disputes access. |
 | No cases listed | Confirm the configured merchant account; load a known dispute ID directly if needed. Only the first list page is queried. |
-| PayPal submission is unavailable | The current detail response has no applicable POST evidence link. Files can still be added for analysis. |
+| PayPal submission is unavailable | The case must be awaiting the seller's response and offer a POST evidence link. Files can still be added for analysis. |
 | OpenAI is not configured | Replace `OPENAI_API_KEY=anyword` in `.env.local` with a real key and restart the app. |
 | Assessment has no policy grounding | Check the visible retrieval warning, indexed documents, database and Gemini configuration. |
 | Assessment requests more evidence | Follow the missing-field suggestions; refund and tracking evidence need their structured references where required. |
-| Preview confirmation is disabled | A specific seller request and complete draft fields are required. |
+| Submission confirmation is disabled | A successful server review, current seller request and complete supported evidence fields are required. |
+| Evidence submission records are unavailable | Check PostgreSQL and run `npm run db:migrate` to create the evidence-submission table. |
+| Evidence submission result is uncertain | Verify the case in PayPal before reconciling its pending/unknown record. Do not blindly resend. |
 | Files disappeared | Drafts are in-memory and reset on reload or when leaving the live workspace. |
 | Timeout or rate limit | Check server connectivity to PayPal; wait before retrying a rate-limited request. |
 | Knowledge database is unavailable | Start PostgreSQL, check `DATABASE_URL`, and apply `npm run db:migrate` with pgvector available. |
-| A knowledge document stays `running` | Start `npm run worker:knowledge` to consume queued jobs and recover expired leases. Failed attempts can be retried manually. |
+| A knowledge document stays `running` | Refresh the knowledge base after the two-minute request lease expires. Listing recovers interrupted attempts as failed; click **Retry processing**. Check the host's execution limit if requests are repeatedly terminated. |
 | Search shows a vector-only warning | Configure `COHERE_API_KEY` and restart the app, or check the reported Cohere credentials, quota, model, and timeout error. |
 | A knowledge document has no search hits | Confirm indexing reached `success`, the document is not soft-deleted, and the configured embedding binding matches. |
 
@@ -655,8 +721,9 @@ Read dispute → Query order and carrier facts → LLM recommendation
 ```
 
 The current implementation covers dispute reads, evidence preparation, local rule
-checks and cited OpenAI assessments using policy retrieval. Remaining work includes
-order/carrier queries, Policy/JEV validation, actual PayPal evidence submission or other actions,
+checks, cited OpenAI assessments using policy retrieval, and merchant-confirmed
+Sandbox evidence submission. Remaining work includes order/carrier queries,
+Policy/JEV validation, other PayPal actions,
 persistent drafts and audit logs, pagination, and application authentication.
 
 ## Origin and attribution

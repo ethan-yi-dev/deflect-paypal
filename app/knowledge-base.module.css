@@ -54,6 +54,9 @@
 .listError { margin: 16px 24px; padding: 12px; border: 1px solid #f2d9d2; border-radius: 6px; background: #fcf0ed; color: #ad5845; font-size: 12px; }
 .notice { margin-top: 14px; font-size: 12px; color: #55723e; }
 .indexButton { white-space: nowrap; }
+.indexButton:disabled { color: #92988e; border-color: #e1e4de; background: #f0f1ee; cursor: not-allowed; opacity: 1; }
+.processingNote { padding: 13px 24px; border-bottom: 1px solid #edf0e9; background: #fcf8ed; color: #8c713a; font-size: 12px; line-height: 1.7; }
+.processingStage { display: block; margin-top: 7px; max-width: 180px; color: #8c713a; font-size: 11px; }
 .deleteButton { color: #ad5845; border-color: #ecd6cf; white-space: nowrap; }
 .deleteButton:hover:not(:disabled) { background: #fcf0ed; border-color: #d8aaa0; }
 .deleteHint { padding: 12px 24px; border-top: 1px solid #edf0e9; color: #87957b; font-size: 11px; line-height: 1.7; }
