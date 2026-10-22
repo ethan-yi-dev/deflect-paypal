@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "db:migrate": "tsx scripts/knowledge-migrate.ts",
+    "test:origin": "tsx --test tests/request-origin.test.ts",
     "test:knowledge": "tsx --test tests/knowledge-base.test.ts tests/knowledge-rerank.test.ts",
     "test:assessment": "tsx --test tests/case-assessment.test.ts",
     "test:evidence": "tsx --test tests/paypal-evidence.test.ts",

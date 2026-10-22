@@ -1,4 +1,5 @@
 import "server-only";
+import { isSameOriginRequest } from "../request-origin";
 import { getBinding, KnowledgeError } from "./config";
 import { getPool, postgresDatabase } from "./database";
 import { KnowledgeRepository } from "./repository";
@@ -24,6 +25,5 @@ export function validateDocId(id: string) {
 }
 
 export function requireSameOrigin(request: Request) {
-  const origin = request.headers.get("origin");
-  if (origin && origin !== new URL(request.url).origin) throw new KnowledgeError("ORIGIN_NOT_ALLOWED", "Cross-origin knowledge requests are not allowed.", 403);
+  if (!isSameOriginRequest(request)) throw new KnowledgeError("ORIGIN_NOT_ALLOWED", "Cross-origin knowledge requests are not allowed.", 403);
 }

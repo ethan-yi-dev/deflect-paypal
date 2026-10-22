@@ -1,4 +1,5 @@
 import { MAX_FILE_BYTES, MAX_TOTAL_BYTES, validateEvidenceFiles } from "../dispute-evidence";
+import { isSameOriginRequest } from "../request-origin";
 import { AssessmentError } from "./config";
 import { MAX_ASSESSMENT_FILES } from "./types";
 
@@ -6,13 +7,7 @@ export type MerchantEvidenceInput = { type: string; notes: string; carrier: stri
 export type AssessmentUpload = { inputs: MerchantEvidenceInput[]; files: Map<string, File> };
 
 export function requireAssessmentOrigin(request: Request) {
-  const origin = request.headers.get("origin");
-  // Next may canonicalize Request.url to localhost. Use the actual HTTP Host so
-  // localhost and 127.0.0.1 both work without accepting a cross-origin browser POST.
-  const expected = new URL(request.url);
-  const host = request.headers.get("host");
-  if (host) expected.host = host;
-  if ((origin && origin !== expected.origin) || request.headers.get("sec-fetch-site") === "cross-site") throw new AssessmentError("ORIGIN_NOT_ALLOWED", "Cross-origin assessment requests are not allowed.", 403);
+  if (!isSameOriginRequest(request)) throw new AssessmentError("ORIGIN_NOT_ALLOWED", "Cross-origin assessment requests are not allowed.", 403);
 }
 
 export async function readAssessmentUpload(request: Request): Promise<AssessmentUpload> {

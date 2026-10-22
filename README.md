@@ -674,6 +674,7 @@ expose a Disputes controller.
 | --- | --- |
 | `npm run dev` | Start the UI and API routes in development. |
 | `npm run lint` | Run ESLint. |
+| `npm run test:origin` | Test same-origin checks for Render HTTPS proxies, local development, and rejection of cross-site requests. |
 | `npm run test:disputes` | Compile and run the mocked Disputes and evidence checks with Node's test runner. |
 | `npm run test:knowledge` | Test PostgreSQL/pgvector storage, document lifecycle, processing recovery, and retrieval/reranking with mocked providers. |
 | `npm run test:assessment` | Test assessment uploads, source context, OpenAI contract, citations, fallback and cancellation with mocked providers. |
