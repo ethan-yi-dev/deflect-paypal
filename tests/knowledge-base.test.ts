@@ -157,10 +157,10 @@ test("a removed active document holds the slot until its request settles", async
 test("a database failure during final persistence rolls back all chunks and records failure", async () => {
   const repo = repository();
   const document = await repo.upload("policy.pdf", pdf);
-  let inserted = 0;
-  const wrapped: Database = { ...db, transaction: (work) => db.transaction((sql) => work(async (text, params) => {
-    if (text.includes("INSERT INTO t_knowledge_chunk") && ++inserted === 2) throw new Error("Storage unavailable");
-    return sql(text, params);
+  const wrapped: Database = { ...db, transaction: (work) => db.transaction((sql) => work(async <T extends object>(text: string, params?: unknown[]) => {
+    const result = await sql<T>(text, params);
+    if (text.includes("INSERT INTO t_knowledge_chunk")) throw new Error("Storage unavailable after batch insert");
+    return result;
   })) };
   const result = await processKnowledgeDocument(new KnowledgeRepository(wrapped, repo.binding), document.id, providers());
   assert.equal(result.status, "failed");
@@ -254,21 +254,27 @@ test("provider failure marks failed and permits a manual retry", async () => {
   assert.equal(stored.errorMessage, null);
 });
 
-test("reindexing deletes old vectors first; an embedding failure leaves no old or partial results", async () => {
+test("reindexing preserves the published index after embedding failure and replaces it on success", async () => {
   const repo = repository();
   const document = await repo.upload("policy.pdf", pdf);
   await processKnowledgeDocument(repo, document.id, providers());
+  const before = await repo.document(document.id);
+  const oldHits = await repo.search(values(), repo.binding, 5);
   let calls = 0;
   await processKnowledgeDocument(repo, document.id, providers({ embed: async () => { if (++calls === 2) throw new Error("Embedding unavailable"); return values(); } }));
   assert.equal((await repo.list()).documents[0].status, "failed");
-  assert.equal((await repo.search(values(), repo.binding, 5)).length, 0);
+  assert.deepEqual(await repo.search(values(), repo.binding, 5), oldHits);
+  assert.equal((await repo.document(document.id)).chunkCount, before.chunkCount);
+  assert.equal((await repo.document(document.id)).indexedAt, before.indexedAt);
   const [old] = await db.query<{ count: number }>("SELECT count(*)::int AS count FROM t_knowledge_chunk WHERE doc_id=$1", [document.id]);
-  assert.equal(old.count, 0);
+  assert.equal(old.count, 2);
   await processKnowledgeDocument(repo, document.id, providers({ parse: async () => [{ pageNumber: 3, text: "Updated policy." }] }));
   const hits = await repo.search(values(), repo.binding, 5);
   assert.equal(hits.length, 1);
   assert.equal(hits[0].content, "Updated policy.");
   assert.equal(hits[0].pageNumber, 3);
+  assert.deepEqual(await repo.retainSearchableHits(oldHits), []);
+  assert.equal((await repo.document(document.id)).chunkCount, 1);
 });
 
 test("expired requests become failed, and an old attempt cannot overwrite a retry", async () => {
@@ -657,4 +663,114 @@ test("reranking rechecks chunk IDs after concurrent soft deletion and a complete
   assert.ok(result.hits.every((hit) => hit.docId === kept.id));
   assert.ok((await repo.list()).documents.find((document) => document.id === replaced.id)?.status === "success");
   assert.equal((await repo.search(values(), repo.binding, 5)).filter((hit) => hit.docId === replaced.id).length, 1);
+});
+
+test("reprocessing keeps old chunks searchable during preparation and uses one batch at commit", async () => {
+  const repo = repository();
+  const document = await repo.upload("policy.pdf", pdf);
+  await processKnowledgeDocument(repo, document.id, providers());
+  const before = await repo.document(document.id);
+  const oldHits = await repo.search(values(), repo.binding, 5);
+  let inserts = 0;
+  let deletes = 0;
+  const wrapped: Database = { ...db, transaction: (work) => db.transaction((sql) => work(async <T extends object>(text: string, params?: unknown[]) => {
+    if (text.startsWith("DELETE FROM t_knowledge_chunk")) deletes++;
+    if (text.includes("INSERT INTO t_knowledge_chunk")) {
+      inserts++;
+      assert.equal(deletes, 1);
+    }
+    return sql<T>(text, params);
+  })) };
+  const result = await processKnowledgeDocument(new KnowledgeRepository(wrapped, repo.binding), document.id, providers({
+    parse: async () => {
+      assert.equal(deletes, 0);
+      const running = await repo.document(document.id);
+      assert.equal(running.status, "running");
+      assert.equal(running.chunkCount, before.chunkCount);
+      assert.equal(running.indexedAt, before.indexedAt);
+      assert.deepEqual(await repo.search(values(), repo.binding, 5), oldHits);
+      assert.deepEqual(await repo.retainSearchableHits(oldHits), oldHits);
+      return [{ pageNumber: 1, text: "New return policy" }, { pageNumber: 2, text: "New delivery policy" }];
+    },
+    embed: async () => {
+      assert.equal(inserts, 0);
+      assert.equal(deletes, 0);
+      assert.deepEqual(await repo.search(values(), repo.binding, 5), oldHits);
+      return values();
+    },
+  }));
+  assert.equal(result.status, "success");
+  assert.equal(inserts, 1);
+  assert.equal(deletes, 1);
+  assert.deepEqual(await repo.retainSearchableHits(oldHits), []);
+  const hits = await repo.search(values(), repo.binding, 5);
+  assert.equal(hits.length, 2);
+  assert.ok(hits.every((hit) => hit.content.startsWith("New ")));
+});
+
+for (const failedStatement of ["INSERT INTO t_knowledge_chunk", "UPDATE t_knowledge_document SET status='success'", "UPDATE t_knowledge_job SET state='done'"]) {
+  test(`replacement rolls back old chunks, vectors and index metadata after ${failedStatement}`, async () => {
+    const repo = repository();
+    const document = await repo.upload("policy.pdf", pdf);
+    await processKnowledgeDocument(repo, document.id, providers());
+    const before = await repo.document(document.id);
+    const oldRows = await db.query("SELECT * FROM t_knowledge_chunk WHERE doc_id=$1 ORDER BY chunk_index", [document.id]);
+    const oldHits = await repo.search(values(), repo.binding, 5);
+    const wrapped: Database = { ...db, transaction: (work) => db.transaction((sql) => work(async <T extends object>(text: string, params?: unknown[]) => {
+      const result = await sql<T>(text, params);
+      if (text.startsWith(failedStatement)) throw new Error("Injected replacement failure");
+      return result;
+    })) };
+    const result = await processKnowledgeDocument(new KnowledgeRepository(wrapped, repo.binding), document.id,
+      providers({ parse: async () => [{ text: "Replacement must not be published", pageNumber: 9 }] }));
+    assert.equal(result.status, "failed");
+    assert.equal(result.chunkCount, before.chunkCount);
+    assert.equal(result.indexedAt, before.indexedAt);
+    assert.deepEqual(await db.query("SELECT * FROM t_knowledge_chunk WHERE doc_id=$1 ORDER BY chunk_index", [document.id]), oldRows);
+    assert.deepEqual(await repo.search(values(), repo.binding, 5), oldHits);
+    assert.deepEqual(await repo.retainSearchableHits(oldHits), oldHits);
+    const [attempt] = await db.query("SELECT state, failed_step FROM t_knowledge_job WHERE doc_id=$1 AND state='failed'", [document.id]);
+    assert.deepEqual(attempt, { state: "failed", failed_step: "store" });
+    assert.equal((await repo.list()).activeProcessing, null);
+  });
+}
+
+for (const scenario of ["parse", "empty", "dimensions", "cancel"] as const) {
+  test(`reprocessing preserves the published index on preparation failure: ${scenario}`, async () => {
+    const repo = repository();
+    const document = await repo.upload("policy.pdf", pdf);
+    await processKnowledgeDocument(repo, document.id, providers());
+    const before = await repo.document(document.id);
+    const oldHits = await repo.search(values(), repo.binding, 5);
+    const controller = new AbortController();
+    const result = await processKnowledgeDocument(repo, document.id, providers({
+      parse: async () => {
+        if (scenario === "parse") throw new Error("Parse unavailable");
+        if (scenario === "cancel") controller.abort();
+        return [{ text: scenario === "empty" ? "" : "New policy", pageNumber: 1 }];
+      },
+      embed: async () => scenario === "dimensions" ? [1, 0, 0] : values(),
+    }), controller.signal);
+    assert.equal(result.status, "failed");
+    assert.equal(result.chunkCount, before.chunkCount);
+    assert.equal(result.indexedAt, before.indexedAt);
+    assert.deepEqual(await repo.search(values(), repo.binding, 5), oldHits);
+  });
+}
+
+test("expired reprocessing keeps the published index and rejects stale replacement", async () => {
+  const repo = repository();
+  const document = await repo.upload("policy.pdf", pdf);
+  await processKnowledgeDocument(repo, document.id, providers());
+  const before = await repo.document(document.id);
+  const oldHits = await repo.search(values(), repo.binding, 5);
+  const { run } = await repo.startProcessing(document.id);
+  await db.query("UPDATE t_knowledge_job SET lease_until=now() - interval '1 second' WHERE id=$1", [run.id]);
+  await repo.recoverExpiredJobs();
+  await assert.rejects(repo.completeJob(run, [{ text: "Stale replacement", pageNumber: 1, embedding: values() }]), { code: "STALE_JOB" });
+  const failed = await repo.document(document.id);
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.chunkCount, before.chunkCount);
+  assert.equal(failed.indexedAt, before.indexedAt);
+  assert.deepEqual(await repo.search(values(), repo.binding, 5), oldHits);
 });

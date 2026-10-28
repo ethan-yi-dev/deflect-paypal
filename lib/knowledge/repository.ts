@@ -119,15 +119,14 @@ export class KnowledgeRepository {
       const runId = randomUUID();
       // Atomic CAS: concurrent requests recheck this predicate after row-lock waits.
       const [row] = await sql<DocumentRow>(`UPDATE t_knowledge_document SET status='running', active_run_id=$3,
-        error_message=NULL, chunk_count=0, indexed_at=NULL, updated_at=now() WHERE id=$1 AND knowledge_base_id=$2 AND deleted_at IS NULL AND status <> 'running'
+        error_message=NULL, updated_at=now() WHERE id=$1 AND knowledge_base_id=$2 AND deleted_at IS NULL AND status <> 'running'
         AND embedding_model=$4 AND embedding_dimensions=$5 RETURNING ${documentColumns}`,
       [docId, b.id, runId, b.embeddingModel, b.embeddingDimensions]);
       if (!row) {
         const existing = await sql("SELECT id FROM t_knowledge_document WHERE id=$1 AND knowledge_base_id=$2 AND deleted_at IS NULL", [docId, b.id]);
         throw new KnowledgeError(existing.length ? "ALREADY_RUNNING" : "DOCUMENT_NOT_FOUND", existing.length ? "This document is already running. Wait for it to finish." : "Document not found.", existing.length ? 409 : 404);
       }
-      // The selected document starts immediately; nothing is queued for later.
-      await sql("DELETE FROM t_knowledge_chunk WHERE doc_id=$1", [docId]);
+      // Keep the published index until completeJob atomically replaces it.
       await sql(`INSERT INTO t_knowledge_job (id, doc_id, source_hash, state, lease_until, stage)
         VALUES ($1,$2,$3,'working',now() + interval '2 minutes','load')`, [runId, docId, row.content_hash]);
       return { document: documentDto(row), run: { id: runId, docId } };
@@ -164,17 +163,21 @@ export class KnowledgeRepository {
   async completeJob(job: ProcessingRun, chunks: KnowledgeChunk[]) {
     if (!chunks.length) throw new KnowledgeError("EMPTY_DOCUMENT", "No searchable text was found in this document.", 422);
     for (const chunk of chunks) validateVector(chunk.embedding, this.binding.embeddingDimensions);
+    // Prepare the batch before taking locks; vectors and text belong to the same row.
+    const batch = JSON.stringify(chunks.map((chunk, index) => ({
+      id: randomUUID(), chunk_index: index, content: chunk.text,
+      page_number: chunk.pageNumber, embedding: JSON.stringify(chunk.embedding),
+    })));
     await this.db.transaction(async (sql) => {
       const b = await this.ensureBase(sql);
       const [lease] = await sql<{ source_hash: string }>("SELECT source_hash FROM t_knowledge_job WHERE id=$1 AND state='working' AND lease_until > now() FOR UPDATE", [job.id]);
       const active = await sql("SELECT id FROM t_knowledge_document WHERE id=$1 AND active_run_id=$2 AND status='running' AND deleted_at IS NULL AND knowledge_base_id=$3 AND content_hash=$4 FOR UPDATE", [job.docId, job.id, b.id, lease?.source_hash ?? ""]);
       if (!lease || !active.length) throw new KnowledgeError("STALE_JOB", "A stale processing request cannot overwrite this document.", 409);
       await sql("DELETE FROM t_knowledge_chunk WHERE doc_id=$1", [job.docId]);
-      for (const [index, chunk] of chunks.entries()) {
-        await sql(`INSERT INTO t_knowledge_chunk (id, doc_id, knowledge_base_id, chunk_index, content, page_number, embedding_model, embedding_dimensions, embedding)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::vector)`,
-        [randomUUID(), job.docId, b.id, index, chunk.text, chunk.pageNumber, b.embeddingModel, b.embeddingDimensions, JSON.stringify(chunk.embedding)]);
-      }
+      await sql(`INSERT INTO t_knowledge_chunk (id, doc_id, knowledge_base_id, chunk_index, content, page_number, embedding_model, embedding_dimensions, embedding)
+        SELECT c.id, $2::uuid, $3, c.chunk_index, c.content, c.page_number, $4, $5::integer, c.embedding::vector
+        FROM jsonb_to_recordset($1::jsonb) AS c(id uuid, chunk_index integer, content text, page_number integer, embedding text)`,
+      [batch, job.docId, b.id, b.embeddingModel, b.embeddingDimensions]);
       await sql("UPDATE t_knowledge_document SET status='success', active_run_id=NULL, chunk_count=$3, indexed_at=now(), updated_at=now(), error_message=NULL WHERE id=$1 AND active_run_id=$2", [job.docId, job.id, chunks.length]);
       await sql("UPDATE t_knowledge_job SET state='done', stage='store', completed_chunks=$2, total_chunks=$2, lease_until=NULL, finished_at=now() WHERE id=$1", [job.id, chunks.length]);
     });
@@ -224,6 +227,7 @@ export class KnowledgeRepository {
     validateVector(vector, b.embeddingDimensions);
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new KnowledgeError("INVALID_CANDIDATE_LIMIT", "Retrieve between 1 and 100 candidates.", 400);
     // The dimension interpolation is a validated integer; all user data remains parameterized.
+    // Published-index metadata survives running/failed attempts; source updates clear it.
     const expression = b.embeddingDimensions === 768 ? "c.embedding::vector(768)" : "c.embedding";
     return this.db.transaction(async (sql) => {
       // pgvector >= 0.8.0: keep scanning when retained soft-deleted chunks or
@@ -235,7 +239,7 @@ export class KnowledgeRepository {
         FROM t_knowledge_chunk c JOIN t_knowledge_document d ON d.id=c.doc_id
         WHERE c.knowledge_base_id=$2 AND c.embedding_model=$3 AND c.embedding_dimensions=$4
         ${b.embeddingDimensions === 768 ? "AND c.embedding_dimensions=768" : ""}
-        AND d.status='success' AND d.deleted_at IS NULL AND d.embedding_model=$3 AND d.embedding_dimensions=$4
+        AND d.indexed_at IS NOT NULL AND d.chunk_count > 0 AND d.deleted_at IS NULL AND d.embedding_model=$3 AND d.embedding_dimensions=$4
         ORDER BY ${expression} <=> $1::vector LIMIT $5`, [JSON.stringify(vector), b.id, b.embeddingModel, b.embeddingDimensions, limit]);
     });
   }
@@ -245,7 +249,7 @@ export class KnowledgeRepository {
     const b = this.binding;
     const rows = await this.db.query<{ id: string }>(`SELECT c.id FROM t_knowledge_chunk c JOIN t_knowledge_document d ON d.id=c.doc_id
       WHERE c.id=ANY($1::uuid[]) AND c.knowledge_base_id=$2 AND c.embedding_model=$3 AND c.embedding_dimensions=$4
-      AND d.status='success' AND d.deleted_at IS NULL AND d.embedding_model=$3 AND d.embedding_dimensions=$4`,
+      AND d.indexed_at IS NOT NULL AND d.chunk_count > 0 AND d.deleted_at IS NULL AND d.embedding_model=$3 AND d.embedding_dimensions=$4`,
     [hits.map((hit) => hit.id), b.id, b.embeddingModel, b.embeddingDimensions]);
     const eligible = new Set(rows.map((row) => row.id));
     return hits.filter((hit) => eligible.has(hit.id));

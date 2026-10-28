@@ -403,7 +403,7 @@ Processing error, cancellation, or expired request lease -> failed -> manual ret
 | **Process document** | Reserves the knowledge base's single processing slot and runs parse, chunking, sequential embedding, and persistence in the initiating request. Other process buttons stay disabled until success or failure. Concurrent requests return 409. |
 | **Update**, unchanged SHA-256 | Returns **No changes**; preserves the source, version, timestamps, chunks, and vectors. No indexing job is created. |
 | **Update**, changed SHA-256 | Checks the current hash with `If-Match`, keeps the document ID, increments the version, deletes old vectors, and returns to `pending` in one transaction. Click **Process document** to rebuild. |
-| **Reprocess** | Forces a full rebuild of the stored source, including removal of old vectors, even when its hash is unchanged. |
+| **Reprocess** | Prepares a full rebuild of the stored source, even when its hash is unchanged. The previous index remains searchable until the replacement commits. |
 | **Retry processing** | Manually starts another attempt after a failure. |
 | **Delete** | Sets `deleted_at`; retains the original, chunks, vectors, and job history while excluding them from the list and search. Repeated deletion is idempotent. |
 
@@ -414,9 +414,13 @@ There is no restore action in the current UI.
 
 Each processing request has a two-minute lease renewed every 30 seconds. The active run ID,
 source hash, and live lease prevent stale requests from publishing results. New
-chunks and `success` commit together; a processing failure leaves no old or
-partially written index. Deleted documents cannot be reactivated by an in-flight
-request. Changed updates are rejected while indexing is running. Stage and embedding
+chunks and embeddings are prepared before a short transaction deletes the previous
+index, batch-inserts the replacement, and commits `success`, chunk count, index time,
+and job completion together. Preparation or persistence failure preserves the previous
+index and its metadata; a first attempt failure publishes no index. Processing status
+and errors describe the latest attempt and are recorded separately from the published
+index. Source updates still clear the index and return to `pending` in their own
+transaction. Deleted documents cannot be reactivated by an in-flight request. Changed updates are rejected while indexing is running. Stage and embedding
 counts persist in PostgreSQL and are shown while processing. Listing documents or
 starting processing marks expired attempts and legacy queued attempts as failed;
 they require a manual retry and never start another document automatically.
@@ -432,8 +436,9 @@ stops polling. Browser tab visibility does not currently pause it.
 ### Retrieval, reranking, and fallback
 
 **Search your knowledge** embeds the query with the bound Google model and
-retrieves up to 50 vector candidates by default. Only `success` documents with
-`deleted_at IS NULL` and matching base/model/dimensions are eligible. The default
+retrieves up to 50 vector candidates by default. Documents with a published index
+(`indexed_at` set and a positive chunk count), no soft deletion (`deleted_at IS NULL`),
+and matching base/model/dimensions are eligible. The default
 768-dimensional vectors use an HNSW cosine index, with transaction-local iterative
 scanning to help fill the candidate set after filtering.
 
