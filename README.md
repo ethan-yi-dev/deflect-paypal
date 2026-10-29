@@ -4,8 +4,13 @@ A customer support workspace for PayPal disputes. Deflect brings the customer's
 concern, case dates, refund request, and evidence requirements into one page,
 then helps support staff prepare an evidence draft and review the next step.
 
-Built with Next.js, React, and TypeScript for the
-[PayPal AI Hackathon](https://paypalaihackathon.devpost.com).
+Built for the [PayPal AI Hackathon](https://paypalaihackathon.devpost.com/),
+Deflect combines PayPal Sandbox dispute data and evidence submission with
+AI-assisted case assessment, merchant-policy retrieval, and response drafting.
+The project explores how PayPal and AI can help merchants prepare evidence-backed
+dispute responses while keeping submission decisions in the merchant's hands.
+
+Built with Next.js, React, and TypeScript.
 
 > **Current scope:** dispute queries use the configured PayPal Sandbox account.
 > Deflect assessment combines case data, uploaded evidence and policy retrieval
